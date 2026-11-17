@@ -1,10 +1,14 @@
 import os
 import sys
 
-version = "v4"
+version = "v5turbo"
 if len(sys.argv) == 1:
     sys.argv.append(version)
 os.environ["version"] = version
+
+
+def vindex(v):
+    return {"v1": 0, "v2": 1, "v3": 2, "v4": 3, "v5turbo": 4}.get(v, 3)
 now_dir = os.getcwd()
 sys.path.insert(0, now_dir)
 import warnings
@@ -152,7 +156,7 @@ def _collect_accelerators():
 _collect_accelerators()
 
 
-v3v4set={"v3","v4"}
+v3v4set={"v3","v4","v5turbo"}
 def set_default():
     global \
         default_batch_size, \
@@ -240,18 +244,20 @@ pretrained_sovits_name = [
     "GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s2G2333k.pth",
     "GPT_SoVITS/pretrained_models/s2Gv3.pth",
     "GPT_SoVITS/pretrained_models/gsv-v4-pretrained/s2Gv4.pth",
+    "GPT_SoVITS/pretrained_models/gsv-v5-pretrained/s2Gv5turbo.pth",
 ]
 pretrained_gpt_name = [
     "GPT_SoVITS/pretrained_models/s1bert25hz-2kh-longer-epoch=68e-step=50232.ckpt",
     "GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s1bert25hz-5kh-longer-epoch=12-step=369668.ckpt",
     "GPT_SoVITS/pretrained_models/s1v3.ckpt",
     "GPT_SoVITS/pretrained_models/s1v3.ckpt",
+    "GPT_SoVITS/pretrained_models/s1v3.ckpt",
 ]
 
 pretrained_model_list = (
-    pretrained_sovits_name[int(version[-1]) - 1],
-    pretrained_sovits_name[int(version[-1]) - 1].replace("s2G", "s2D"),
-    pretrained_gpt_name[int(version[-1]) - 1],
+    pretrained_sovits_name[vindex(version)],
+    pretrained_sovits_name[vindex(version)].replace("s2G", "s2D"),
+    pretrained_gpt_name[vindex(version)],
     "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large",
     "GPT_SoVITS/pretrained_models/chinese-hubert-base",
 )
@@ -633,7 +639,7 @@ def open1Ba(
         data["train"]["lora_rank"] = lora_rank
         data["model"]["version"] = version
         data["data"]["exp_dir"] = data["s2_ckpt_dir"] = s2_dir
-        data["save_weight_dir"] = SoVITS_weight_root[int(version[-1]) - 1]
+        data["save_weight_dir"] = SoVITS_weight_root[vindex(version)]
         data["name"] = exp_name
         data["version"] = version
         tmp_config_path = "%s/tmp_s2.json" % tmp
@@ -714,7 +720,7 @@ def open1Bb(
         data["train"]["if_save_every_weights"] = if_save_every_weights
         data["train"]["if_save_latest"] = if_save_latest
         data["train"]["if_dpo"] = if_dpo
-        data["train"]["half_weights_save_dir"] = GPT_weight_root[int(version[-1]) - 1]
+        data["train"]["half_weights_save_dir"] = GPT_weight_root[vindex(version)]
         data["train"]["exp_name"] = exp_name
         data["train_semantic_path"] = "%s/6-name2semantic.tsv" % s1_dir
         data["train_phoneme_path"] = "%s/2-name2text.txt" % s1_dir
@@ -1300,17 +1306,17 @@ def switch_version(version_):
     os.environ["version"] = version_
     global version
     version = version_
-    if pretrained_sovits_name[int(version[-1]) - 1] != "" and pretrained_gpt_name[int(version[-1]) - 1] != "":
+    if pretrained_sovits_name[vindex(version)] != "" and pretrained_gpt_name[vindex(version)] != "":
         ...
     else:
         gr.Warning(i18n("未下载模型") + ": " + version.upper())
     set_default()
     return (
-        {"__type__": "update", "value": pretrained_sovits_name[int(version[-1]) - 1]},
-        {"__type__": "update", "value": pretrained_sovits_name[int(version[-1]) - 1].replace("s2G", "s2D")},
-        {"__type__": "update", "value": pretrained_gpt_name[int(version[-1]) - 1]},
-        {"__type__": "update", "value": pretrained_gpt_name[int(version[-1]) - 1]},
-        {"__type__": "update", "value": pretrained_sovits_name[int(version[-1]) - 1]},
+        {"__type__": "update", "value": pretrained_sovits_name[vindex(version)]},
+        {"__type__": "update", "value": pretrained_sovits_name[vindex(version)].replace("s2G", "s2D")},
+        {"__type__": "update", "value": pretrained_gpt_name[vindex(version)]},
+        {"__type__": "update", "value": pretrained_gpt_name[vindex(version)]},
+        {"__type__": "update", "value": pretrained_sovits_name[vindex(version)]},
         {"__type__": "update", "value": default_batch_size, "maximum": default_max_batch_size},
         {"__type__": "update", "value": default_sovits_epoch, "maximum": max_sovits_epoch},
         {"__type__": "update", "value": default_sovits_save_every_epoch, "maximum": max_sovits_save_every_epoch},
@@ -1497,11 +1503,11 @@ with gr.Blocks(title="GPT-SoVITS WebUI") as app:
                 with gr.Row():
                     exp_name = gr.Textbox(label=i18n("*实验/模型名"), value="xxx", interactive=True)
                     gpu_info = gr.Textbox(label=i18n("显卡信息"), value=gpu_info, visible=True, interactive=False)
-                    version_checkbox = gr.Radio(label=i18n("版本"), value=version, choices=["v4"], interactive=False)
+                    version_checkbox = gr.Radio(label=i18n("版本"), value=version, choices=["v4", "v5turbo"], interactive=True)
                 with gr.Row():
                     pretrained_s2G = gr.Textbox(
                         label=i18n("预训练SoVITS-G模型路径"),
-                        value=pretrained_sovits_name[int(version[-1]) - 1],
+                        value=pretrained_sovits_name[vindex(version)],
                         interactive=True,
                         lines=2,
                         max_lines=3,
@@ -1509,7 +1515,7 @@ with gr.Blocks(title="GPT-SoVITS WebUI") as app:
                     )
                     pretrained_s2D = gr.Textbox(
                         label=i18n("预训练SoVITS-D模型路径"),
-                        value=pretrained_sovits_name[int(version[-1]) - 1].replace("s2G", "s2D"),
+                        value=pretrained_sovits_name[vindex(version)].replace("s2G", "s2D"),
                         interactive=True,
                         lines=2,
                         max_lines=3,
@@ -1517,7 +1523,7 @@ with gr.Blocks(title="GPT-SoVITS WebUI") as app:
                     )
                     pretrained_s1 = gr.Textbox(
                         label=i18n("预训练GPT模型路径"),
-                        value=pretrained_gpt_name[int(version[-1]) - 1],
+                        value=pretrained_gpt_name[vindex(version)],
                         interactive=True,
                         lines=2,
                         max_lines=3,
@@ -1606,7 +1612,7 @@ with gr.Blocks(title="GPT-SoVITS WebUI") as app:
                     with gr.Row():
                         pretrained_s2G_ = gr.Textbox(
                             label=i18n("预训练SoVITS-G模型路径"),
-                            value=pretrained_sovits_name[int(version[-1]) - 1],
+                            value=pretrained_sovits_name[vindex(version)],
                             interactive=False,
                             lines=2,
                         )

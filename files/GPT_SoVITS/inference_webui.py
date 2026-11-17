@@ -39,11 +39,13 @@ try:
     analytics.version_check = lambda: None
 except:
     ...
-version = model_version = os.environ.get("version", "v4")
+version = model_version = os.environ.get("version", "v5turbo")
 path_sovits_v3 = "GPT_SoVITS/pretrained_models/s2Gv3.pth"
 path_sovits_v4 = "GPT_SoVITS/pretrained_models/gsv-v4-pretrained/s2Gv4.pth"
+path_sovits_v5turbo = "GPT_SoVITS/pretrained_models/gsv-v5-pretrained/s2Gv5turbo.pth"
 is_exist_s2gv3 = os.path.exists(path_sovits_v3)
 is_exist_s2gv4 = os.path.exists(path_sovits_v4)
+is_exist_s2gv5turbo = os.path.exists(path_sovits_v5turbo)
 pretrained_sovits_name = [
     "GPT_SoVITS/pretrained_models/s2G488k.pth",
     "GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s2G2333k.pth",
@@ -242,12 +244,12 @@ def resample(audio_tensor, sr0,sr1):
 # symbol_version-model_version-if_lora_v3
 from process_ckpt import get_sovits_version_from_path_fast, load_sovits_new
 
-v3v4set={"v3","v4"}
+v3v4set={"v3","v4","v5turbo"}
 def change_sovits_weights(sovits_path, prompt_language=None, text_language=None):
     global vq_model, hps, version, model_version, dict_language, if_lora_v3
     version, model_version, if_lora_v3 = get_sovits_version_from_path_fast(sovits_path)
     print(sovits_path,version, model_version, if_lora_v3)
-    is_exist=is_exist_s2gv3 if model_version=="v3"else is_exist_s2gv4
+    is_exist=(is_exist_s2gv3 if model_version=="v3" else is_exist_s2gv5turbo if model_version=="v5turbo" else is_exist_s2gv4)
     if if_lora_v3 == True and is_exist == False:
         info = "GPT_SoVITS/pretrained_models/s2Gv3.pth" + i18n("SoVITS %s 底模缺失，无法加载相应 LoRA 权重"%model_version)
         gr.Warning(info)
@@ -328,7 +330,7 @@ def change_sovits_weights(sovits_path, prompt_language=None, text_language=None)
     if if_lora_v3 == False:
         print("loading sovits_%s" % model_version, vq_model.load_state_dict(dict_s2["weight"], strict=False))
     else:
-        path_sovits = path_sovits_v3 if model_version == "v3" else path_sovits_v4
+        path_sovits = (path_sovits_v3 if model_version == "v3" else path_sovits_v5turbo if model_version == "v5turbo" else path_sovits_v4)
         print(
             "loading sovits_%spretrained_G"%model_version,
             vq_model.load_state_dict(load_sovits_new(path_sovits)["weight"], strict=False),

@@ -82,11 +82,551 @@ index 0000000..efb7f97
 +            torch.mps.empty_cache()
 +    except Exception:
 +        pass
+diff --git a/GPT_SoVITS/module/cache_dit.py b/GPT_SoVITS/module/cache_dit.py
+new file mode 100644
+index 0000000..3449a86
+--- /dev/null
++++ b/GPT_SoVITS/module/cache_dit.py
+@@ -0,0 +1,437 @@
++"""cache-dit / DBCache (three-segment block caching) for the DiT/CFM sampler.
++
++Follows vipshop/cache-dit (`CachedBlocks_Pattern_Base.forward`), adapted to the way this repo
++samples: the block stack is split into three segments, and the middle one is skipped when the
++front residual barely moved.
++
++    front : trunk(x_in) -> blocks[0:Fn] -> x_F        (every step)
++            R    = x_F - trunk(x_in)                  Fn residual, the decision signal
++            fd   = sum|R - R_prev| / (sum|R_prev| + eps)          (relative -> scale free)
++    hit   : x_mid = x_F + MnResidual_prev, then head only (norm_out -> proj_out)
++    miss  : x_F -> blocks[Fn:DEPTH] -> x_M;  MnResidual = x_M - x_F;  R -> R_prev
++    head  : x_mid -> norm_out -> proj_out -> vel              (every step, hit included)
++
++A hit additionally requires `can_cache`: not in warmup, `fd < threshold`, and the three gates
++`max_cached` (cached steps per sampling run), `max_cont` (consecutive hits) and `max_accum`
++(accumulated residual drift).
++
++CFG. This repo runs the conditional and the unconditional branch as **two separate forward
++passes** (`CFM.inference`), so each branch owns its own `R_prev`, `MnResidual`, hit/miss
++counters and gate counters -- the equivalent of cache-dit's `enable_separate_cfg` plus
++`cfg_diff_compute_separate`.  Nothing is shared between the branches.
++
++Everything here is inert unless a `DBCacheConfig` with `fn > 0` is handed to `DiT.forward`;
++`cache_dit="off"` keeps the sampler on the identical code path it had before this change.
++"""
++
++from __future__ import annotations
++
++import os
++from dataclasses import dataclass, replace
++
++import torch
++
++__all__ = [
++    "DBCacheConfig",
++    "DBCacheState",
++    "resolve_fn",
++    "config_from_params",
++    "MODES",
++]
++
++MODES = ("off", "auto", "f4", "f8", "f16")
++
++# Defaults of the cache-dit reference recipe, and the `auto` policy used by the HTTP API
++# (F8 from 16 sampling steps on, off below that).
++DEFAULT_FN = 8
++DEFAULT_THRESHOLD = 0.02
++DEFAULT_WARMUP = 8
++DEFAULT_DOWNSAMPLE = 4
++AUTO_FN = 8
++AUTO_MIN_STEPS = 16
++
++_EPS = 1e-6
++
++
++def resolve_fn(mode, steps=32, depth=None):
++    """`off|auto|f4|f8|f16` (or a plain integer) -> number of front blocks."""
++    if mode is None:
++        return 0
++    if isinstance(mode, bool):
++        mode = int(mode)
++    if isinstance(mode, (int, float)):
++        fn = int(mode)
++    else:
++        text = str(mode).strip().lower()
++        if text in ("", "off", "none", "0", "false", "no"):
++            fn = 0
++        elif text in ("on", "true", "yes"):
++            fn = DEFAULT_FN
++        elif text == "auto":
++            fn = AUTO_FN if int(steps) >= AUTO_MIN_STEPS else 0
++        elif text.startswith("f") and text[1:].isdigit():
++            fn = int(text[1:])
++        elif text.isdigit():
++            fn = int(text)
++        else:
++            raise ValueError("unknown cache_dit mode %r (expected off|auto|f4|f8|f16)" % (mode,))
++    if depth is not None:
++        fn = max(0, min(fn, int(depth) - 1))
++    return fn
++
++
++@dataclass
++class DBCacheConfig:
++    """cache-dit knobs. `fn == 0` means off (the default)."""
++
++    mode: str = "off"
++    fn: int = 0
++    threshold: float = DEFAULT_THRESHOLD
++    warmup: int = DEFAULT_WARMUP
++    downsample: int = DEFAULT_DOWNSAMPLE
++    warmup_interval: int = 1
++    max_cached: int = -1
++    max_cont: int = -1
++    max_accum: float = 0.0
++    # fd is reduced over the whole sequence by default: the prompt/reference frames carry a
++    # nearly constant residual, so they dilute the ratio and threshold 0.02 stays usable. Set
++    # to True to reduce over the target frames only -- a ~3x stricter signal on this model, so
++    # thresholds are not transferable between the two conventions.
++    fd_ignore_prompt: bool = False
++    trace: bool = False
++    # expert override: allow cache-dit below 16 sampling steps (see docs in
++    # `DBCacheMixin.dbcache_config`: too few steps gain nothing and the quality risk is real)
++    force: bool = False
++
++    @property
++    def enabled(self) -> bool:
++        return self.fn > 0
++
++    def clamped(self, depth: int | None = None) -> "DBCacheConfig":
++        if depth is None:
++            return self
++        return replace(self, fn=max(0, min(int(self.fn), int(depth) - 1)))
++
++    def __str__(self) -> str:  # for logs
++        if not self.enabled:
++            return "off"
++        return ("%s(fn=%d thr=%.3g warmup=%d ds=%d mc=%d mcont=%d macc=%.3g)"
++                % (self.mode, self.fn, self.threshold, self.warmup, self.downsample,
++                   self.max_cached, self.max_cont, self.max_accum))
++
++
++def _get(params, key, env, default, cast):
++    """request dict first (API field names), then env, then default."""
++    if params is not None:
++        for k in (key,):
++            if k in params and params[k] is not None and params[k] != "":
++                try:
++                    return cast(params[k])
++                except (TypeError, ValueError):
++                    pass
++    val = os.environ.get(env)
++    if val is not None and val != "":
++        try:
++            return cast(val)
++        except (TypeError, ValueError):
++            pass
++    return default
++
++
++def config_from_params(params=None, steps=32, depth=None) -> DBCacheConfig:
++    """Build the config from a request dict / env vars.
++
++    Field names match the HTTP API of our C++ server:
++        cache_dit (alias dbcache) = off|auto|f4|f8|f16
++        dbcache_fn, dbcache_threshold, dbcache_warmup, dbcache_downsample
++        dbcache_warmup_interval, dbcache_max_cached, dbcache_max_cont, dbcache_max_accum
++    Env fallbacks: GSV_DBCACHE / GSV_DBCACHE_FN / _THRESHOLD / _WARMUP / _DOWNSAMPLE / ...
++    """
++    p = dict(params or {})
++    mode = p.get("cache_dit", p.get("dbcache", os.environ.get("GSV_DBCACHE", "off")))
++    mode = "off" if mode is None else str(mode).strip().lower()
++
++    cfg = DBCacheConfig(mode=mode)
++    cfg.threshold = _get(p, "dbcache_threshold", "GSV_DBCACHE_THRESHOLD", cfg.threshold, float)
++    cfg.warmup = _get(p, "dbcache_warmup", "GSV_DBCACHE_WARMUP", cfg.warmup, int)
++    cfg.downsample = max(1, _get(p, "dbcache_downsample", "GSV_DBCACHE_DOWNSAMPLE", cfg.downsample, int))
++    cfg.warmup_interval = max(1, _get(p, "dbcache_warmup_interval", "GSV_DBCACHE_WARMUP_INTERVAL",
++                                      cfg.warmup_interval, int))
++    cfg.max_cached = _get(p, "dbcache_max_cached", "GSV_DBCACHE_MAX_CACHED", cfg.max_cached, int)
++    cfg.max_cont = _get(p, "dbcache_max_cont", "GSV_DBCACHE_MAX_CONT", cfg.max_cont, int)
++    cfg.max_accum = _get(p, "dbcache_max_accum", "GSV_DBCACHE_MAX_ACCUM", cfg.max_accum, float)
++    cfg.fd_ignore_prompt = bool(_get(p, "dbcache_fd_ignore_prompt", "GSV_DBCACHE_FD_IGNORE_PROMPT",
++                                     int(cfg.fd_ignore_prompt), int))
++    cfg.trace = bool(_get(p, "dbcache_trace", "GSV_DBCACHE_TRACE", 0, int))
++    cfg.force = bool(_get(p, "dbcache_force", "GSV_DBCACHE_FORCE", 0, int))
++
++    # an explicit fn wins over the mode
++    if p.get("dbcache_fn") not in (None, ""):
++        cfg.fn = int(p["dbcache_fn"])
++        cfg.mode = "custom"
++    elif os.environ.get("GSV_DBCACHE_FN"):
++        cfg.fn = int(os.environ["GSV_DBCACHE_FN"])
++        cfg.mode = "custom"
++    else:
++        cfg.fn = resolve_fn(mode, steps)
++    if depth is not None:
++        cfg.fn = max(0, min(cfg.fn, int(depth) - 1))
++    return cfg
++
++
++class DBCacheMixin:
++    """The CFM-side plumbing (`set_dbcache` / per-run state / hit counters).
++
++    Mixed into `module.models.CFM` and `module.v5_inference.CFMV5`; both expose the DiT as
++    `self.estimator`.  Defaults are class attributes, so `cache off` needs no `__init__` change
++    and the object layout of an existing checkpoint-compatible model is untouched.
++    """
++
++    dbcache_spec = None            # DBCacheConfig or request dict of dbcache_* fields
++    last_dbcache_stats = None      # stats of the most recent inference() call
++    _dbcache_cum = None            # accumulated over all calls (reset by dbcache_stats)
++
++    # ------------------------------------------------------------------ config
++    @property
++    def cache_depth(self):
++        return int(getattr(self.estimator, "depth", 0) or 0)
++
++    def set_dbcache(self, spec=None, **kw):
++        """Enable/disable cache-dit for the next sampling runs.
++
++        `spec` is either a `module.cache_dit.DBCacheConfig` or a dict using the C++ server's
++        field names (`cache_dit`/`dbcache` + `dbcache_fn|threshold|warmup|downsample|...`).
++        Nothing is applied retroactively: `inference()` resolves it per call.
++        """
++        if isinstance(spec, DBCacheConfig):
++            self.dbcache_spec = spec
++        else:
++            merged = dict(spec or {})
++            merged.update(kw)
++            cfg = merged.pop("config", None)
++            self.dbcache_spec = cfg if isinstance(cfg, DBCacheConfig) else merged
++        return self.dbcache_spec
++
++    def dbcache_config(self, steps):
++        """Resolve the spec against the step count of the run that is about to start.
++
++        With no explicit spec the env switch (`GSV_DBCACHE=off|auto|f4|f8|f16`) is honoured,
++        so every entry point (WebUI, api.py, api_v2.py, CLI, Colab) can enable cache-dit
++        without extra plumbing.  Below 16 sampling steps (the 4-step v5turbo) it stays off:
++        the measured gain is negative and the quality is unstable there.
++        """
++        depth = self.cache_depth or None
++        spec = self.dbcache_spec
++        if isinstance(spec, DBCacheConfig):
++            fn = spec.fn if spec.mode in ("custom", None) else resolve_fn(spec.mode, steps, depth)
++            cfg = DBCacheConfig(**{**spec.__dict__,
++                                   "fn": fn if depth is None else min(fn, depth - 1)})
++        else:
++            cfg = config_from_params(spec, steps, depth)
++        if cfg.enabled and int(steps) < AUTO_MIN_STEPS and not cfg.force:
++            cfg.fn = 0
++        return cfg
++
++    # ------------------------------------------------------------------ per run
++    def _dbcache_begin(self, steps, seq_len, prompt_len, x_lens, device):
++        """Fresh state per sampling run (new request / new chunk)."""
++        cfg = self.dbcache_config(steps)
++        if not cfg.enabled:
++            self.last_dbcache_stats = None
++            return None
++        return DBCacheState(cfg, self.cache_depth).begin(seq_len, prompt_len, x_lens, device)
++
++    def _dbcache_end(self, state):
++        if state is None:
++            return
++        st = state.stats()
++        self.last_dbcache_stats = st
++        cum = self._dbcache_cum
++        if cum is None:
++            cum = self._dbcache_cum = {"calls": 0, "steps": 0, "hits_pos": 0, "hits_neg": 0,
++                                       "misses_pos": 0, "misses_neg": 0}
++        cum["calls"] += 1
++        for k in ("steps", "hits_pos", "hits_neg", "misses_pos", "misses_neg"):
++            cum[k] = cum.get(k, 0) + st[k]
++        cum["hits"] = cum["hits_pos"] + cum["hits_neg"]
++        cum["misses"] = cum["misses_pos"] + cum["misses_neg"]
++        cum["total"] = cum["hits"] + cum["misses"]
++        cum["hit_rate"] = cum["hits"] / cum["total"] if cum["total"] else 0.0
++        cum["fn"] = st.get("fn")
++        cum["threshold"] = st.get("threshold")
++        cum["last"] = st
++
++    def dbcache_stats(self, reset=True):
++        """Hit/miss counters accumulated since the last reset (None when cache-dit is off)."""
++        st = self._dbcache_cum
++        if reset:
++            self._dbcache_cum = None
++        return st
++
++
++class _Branch:
++    """Per-CFG-branch bookkeeping."""
++
++    __slots__ = ("valid", "r_prev", "r_cur", "m_res", "hits", "misses",
++                 "cached_steps", "cont", "acc", "last_fd")
++
++    def __init__(self):
++        self.valid = False
++        self.r_prev = None
++        self.r_cur = None
++        self.m_res = None
++        self.hits = 0
++        self.misses = 0
++        self.cached_steps = 0
++        self.cont = 0
++        self.acc = 0.0
++        self.last_fd = 0.0
++
++    def reset(self):
++        self.__init__()
++
++
++class DBCacheState:
++    """State of one sampling run (`CFM.inference` = one run = one new request / chunk)."""
++
++    def __init__(self, config: DBCacheConfig, depth: int, trace: bool | None = None):
++        self.cfg = config
++        self.depth = int(depth)
++        self.trace = config.trace if trace is None else trace
++        self.step = 0
++        self.n_steps = 0
++        self.branches = [_Branch(), _Branch()]
++        self.ds = 1
++        self.note = ""  # free-form tag for logs
++
++    # ------------------------------------------------------------------ lifecycle
++    def begin(self, seq_len: int, prompt_len: int, x_lens=None, device=None):
++        """Reset for a new sampling run. Called once per `CFM.inference`."""
++        for b in self.branches:
++            b.reset()
++        self.step = 0
++        self.n_steps = 0
++        ds = int(self.cfg.downsample) if self.cfg.downsample else 1
++        self.ds = ds if ds >= 1 and seq_len % ds == 0 else 1
++        self._build_frame_mask(seq_len, prompt_len, x_lens, device)
++        return self
++
++    def _build_frame_mask(self, seq_len, prompt_len, x_lens, device):
++        """Frames used for fd: skip the prompt/reference rows and the padding."""
++        self.mask = None
++        if not self.cfg.fd_ignore_prompt:
++            return
++        idx = torch.arange(seq_len, device=device)
++        mask = idx.unsqueeze(0) >= int(max(0, prompt_len))
++        if x_lens is not None:
++            lens = torch.as_tensor(x_lens, device=device).reshape(-1, 1)
++            if lens.shape[0] == 1 and seq_len >= int(lens.max()):
++                mask = mask & (idx.unsqueeze(0) < lens)
++        mask = mask.to(torch.float32)
++        if self.ds > 1:
++            mask = mask[:, :: self.ds]
++        mask = mask.unsqueeze(-1)          # (b, n/ds, 1)
++        if float(mask.sum()) <= 0.0:       # degenerate (all-prompt) -> fall back to everything
++            mask = None
++        self.mask = mask
++
++    def step_begin(self, step: int):
++        """`db_set_step(j)`: current diffusion step, drives warmup and the trace."""
++        self.step = int(step)
++        self.n_steps += 1
++
++    def in_warmup(self) -> bool:
++        if self.step >= self.cfg.warmup:
++            return False
++        return (self.step % max(1, self.cfg.warmup_interval)) == 0
++
++    # ------------------------------------------------------------------ per-step ops
++    @property
++    def enabled(self) -> bool:
++        return self.cfg.enabled
++
++    @property
++    def fn(self) -> int:
++        return self.cfg.fn
++
++    def branch(self, index: int) -> _Branch:
++        return self.branches[0 if index == 0 else 1]
++
++    def front_update(self, index: int, x_f, trunk) -> float:
++        """Store x_F / R, update R_prev-based similarity, return `fd` (one host sync)."""
++        br = self.branch(index)
++        r = x_f.float() - trunk.float()                  # Fn residual; fp32 keeps fd stable
++        if self.ds > 1:
++            r = r[:, :: self.ds, :]
++        r_prev = br.r_prev
++        if r_prev is None or r_prev.shape != r.shape:
++            r_prev = torch.zeros_like(r)
++        num = (r - r_prev).abs()
++        den = r_prev.abs()
++        if self.mask is not None and self.mask.shape[0] == num.shape[0] \
++                and self.mask.shape[1] == num.shape[1]:
++            num = num * self.mask
++            den = den * self.mask
++        num = num.sum(dim=(1, 2))
++        den = den.sum(dim=(1, 2)) + _EPS
++        fd = float((num / den).max().item())            # the only device->host scalar per step
++        br.r_cur = r
++        br.last_fd = fd
++        return fd
++
++    def can_cache(self, index: int, fd: float) -> bool:
++        br = self.branch(index)
++        cfg = self.cfg
++        hit = False
++        if br.valid and cfg.threshold > 0.0 and not self.in_warmup():
++            ok = fd < cfg.threshold
++            if ok and cfg.max_cached >= 0 and br.cached_steps >= cfg.max_cached:
++                ok = False
++            if ok and cfg.max_cont >= 0 and br.cont >= cfg.max_cont:
++                ok = False
++                br.cont = 0
++            if ok and cfg.max_accum > 0.0 and br.acc >= cfg.max_accum:
++                ok = False
++            hit = ok
++        if fd > 0.0:
++            br.acc += fd
++        return hit
++
++    def mid_residual(self, index: int):
++        return self.branch(index).m_res
++
++    def on_hit(self, index: int):
++        br = self.branch(index)
++        br.hits += 1
++        br.cached_steps += 1
++        br.cont += 1
++
++    def on_miss(self, index: int, x_m, x_f):
++        br = self.branch(index)
++        br.misses += 1
++        br.valid = True
++        br.cont = 0
++        br.m_res = (x_m - x_f)
++        if br.r_cur is not None:
++            if br.r_prev is None or br.r_prev.shape != br.r_cur.shape:
++                br.r_prev = br.r_cur.clone()
++            else:
++                br.r_prev.copy_(br.r_cur)
++
++    # ------------------------------------------------------------------ reporting
++    def stats(self) -> dict:
++        out = {"steps": self.n_steps, "last_step": self.step, "fn": self.cfg.fn,
++               "threshold": self.cfg.threshold, "warmup": self.cfg.warmup,
++               "downsample": self.ds, "mode": self.cfg.mode}
++        for i, name in enumerate(("pos", "neg")):
++            br = self.branches[i]
++            out["hits_" + name] = br.hits
++            out["misses_" + name] = br.misses
++            out["fd_" + name] = br.last_fd
++            out["acc_" + name] = br.acc
++        out["hits"] = out["hits_pos"] + out["hits_neg"]
++        out["misses"] = out["misses_pos"] + out["misses_neg"]
++        total = out["hits"] + out["misses"]
++        out["total"] = total
++        out["hit_rate"] = (out["hits"] / total) if total else 0.0
++        return out
+diff --git a/GPT_SoVITS/module/models_v5.py b/GPT_SoVITS/module/models_v5.py
+new file mode 100644
+index 0000000..c8f595b
+--- /dev/null
++++ b/GPT_SoVITS/module/models_v5.py
+@@ -0,0 +1,84 @@
++import os
++
++import torch
++from module.models import CFM
++
++
++V5_TEMPERATURE = 0.875
++V5_REFERENCE_ANCHOR = 1.0
++V5_ROLLING_TAIL_FRAMES = 32
++V5_MAX_TARGET_CHUNK_FRAMES = 640
++V5_REFERENCE_FRAMES = 500
++V5_TOTAL_CHUNK_FRAMES = 1000
++V5_VERSIONS = {"v5dev", "v5turbo"}
++
++
++class CFMV5(CFM):
++    def __init__(self, in_channels, dit):
++        super().__init__(in_channels, dit)
++        self.use_step_embedding = False
++        self.cfg_drop_text = False
++        self.noise_temperature = V5_TEMPERATURE
++        self.use_static_cache = os.environ.get(
++            "GSVV5_CFM_STATIC_CACHE", os.environ.get("GSVV4_CFM_STATIC_CACHE", "1")
++        ) != "0"
++
++    @torch.inference_mode()
++    def inference(self, mu, x_lens, prompt, n_timesteps, temperature=V5_TEMPERATURE,
++                  inference_cfg_rate=1.30, generator=None):
++        return super().inference(mu, x_lens, prompt, n_timesteps, temperature, inference_cfg_rate, generator=generator)
++
++    def forward(self, x1, x_lens, prompt_lens, mu, use_grad_ckpt):
++        b = x1.shape[0]
++        t = torch.rand([b], device=mu.device, dtype=x1.dtype)
++        x0 = torch.randn_like(x1, device=mu.device)
++        vt = x1 - x0
++        xt = x0 + t[:, None, None] * vt
++        prompt = torch.zeros_like(x1)
++        for i in range(b):
++            prompt[i, :, : prompt_lens[i]] = x1[i, :, : prompt_lens[i]]
++            xt[i, :, : prompt_lens[i]] = 0
++        vt_pred = self.estimator(
++            xt, prompt, x_lens, t, text0=mu, use_grad_ckpt=use_grad_ckpt,
++        ).transpose(2, 1)
++        loss = 0
++        for i in range(b):
++            loss += self.criterion(vt_pred[i, :, prompt_lens[i] : x_lens[i]], vt[i, :, prompt_lens[i] : x_lens[i]])
++        return loss / b
++
++
++@torch.inference_mode()
++def synthesize_v5_mel(model, reference_features, target_features, reference_mel,
++                      sample_steps=None, cfg_rate=None):
++    steps = (4 if model.version == "v5turbo" else 32) if sample_steps is None else int(sample_steps)
++    cfg = (1.30 if model.version == "v5dev" else 0.0) if cfg_rate is None else float(cfg_rate)
++    reference_frames = min(reference_mel.shape[-1], reference_features.shape[-1])
++    reference_mel = reference_mel[..., :reference_frames][..., -V5_REFERENCE_FRAMES:]
++    reference_features = reference_features[..., :reference_frames][..., -V5_REFERENCE_FRAMES:]
++    reference_frames = reference_mel.shape[-1]
++    chunk_frames = min(V5_TOTAL_CHUNK_FRAMES - reference_frames, V5_MAX_TARGET_CHUNK_FRAMES)
++    original_mel = reference_mel
++    original_features = reference_features
++    rolling_mel = reference_mel
++    rolling_features = reference_features
++    results = []
++    for index, start in enumerate(range(0, target_features.shape[-1], chunk_frames)):
++        target = target_features[..., start:start + chunk_frames]
++        if index == 0:
++            prompt = original_mel
++            features = original_features
++        else:
++            tail = min(V5_ROLLING_TAIL_FRAMES, reference_frames,
++                       rolling_mel.shape[-1], rolling_features.shape[-1])
++            prefix = reference_frames - tail
++            prompt = torch.cat((original_mel[..., :prefix], rolling_mel[..., -tail:]), dim=-1)
++            features = torch.cat((original_features[..., :prefix], rolling_features[..., -tail:]), dim=-1)
++        mu = torch.cat((features, target), dim=-1).transpose(2, 1)
++        lengths = torch.full((mu.shape[0],), mu.shape[1], dtype=torch.long, device=mu.device)
++        generated = model.cfm.inference(
++            mu, lengths, prompt, steps, inference_cfg_rate=cfg,
++        )[..., prompt.shape[-1]:]
++        results.append(generated)
++        rolling_mel = generated[..., -reference_frames:].to(reference_mel.dtype)
++        rolling_features = target[..., -reference_frames:]
++    return torch.cat(results, dim=-1)
 diff --git a/config.py b/config.py
-index 5f90c5c..a1cdd16 100644
+index 5f90c5c..81a1e46 100644
 --- a/config.py
 +++ b/config.py
-@@ -18,10 +18,23 @@
+@@ -13,15 +13,28 @@
+ 
+ cnhubert_path = "GPT_SoVITS/pretrained_models/chinese-hubert-base"
+ bert_path = "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large"
+-pretrained_sovits_path = "GPT_SoVITS/pretrained_models/s2G488k.pth"
+-pretrained_gpt_path = "GPT_SoVITS/pretrained_models/s1bert25hz-2kh-longer-epoch=68e-step=50232.ckpt"
++pretrained_sovits_path = "GPT_SoVITS/pretrained_models/gsv-v5-pretrained/s2Gv5turbo.pth"
++pretrained_gpt_path = "GPT_SoVITS/pretrained_models/s1v3.ckpt"
  
  exp_root = "logs"
  python_exec = sys.executable or "python"
@@ -128,22 +668,27 @@ index 4b79d50..5b3c09a 100644
  parser.add_argument("-p", "--port", type=int, default=g_config.api_port, help="default: 9880")
  parser.add_argument(
 diff --git a/webui.py b/webui.py
-index 0732d8c..13bb281 100644
+index 0732d8c..e256982 100644
 --- a/webui.py
 +++ b/webui.py
-@@ -1,9 +1,9 @@
+@@ -1,10 +1,14 @@
  import os
  import sys
  
-+version = "v4"
++version = "v5turbo"
  if len(sys.argv) == 1:
 -    sys.argv.append("v2")
 -version = "v1" if sys.argv[1] == "v1" else "v2"
 +    sys.argv.append(version)
  os.environ["version"] = version
++
++
++def vindex(v):
++    return {"v1": 0, "v2": 1, "v3": 2, "v4": 3, "v5turbo": 4}.get(v, 3)
  now_dir = os.getcwd()
  sys.path.insert(0, now_dir)
-@@ -18,7 +18,10 @@
+ import warnings
+@@ -18,7 +22,10 @@
  
  import psutil
  import torch
@@ -155,7 +700,7 @@ index 0732d8c..13bb281 100644
  import yaml
  
  os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
-@@ -98,53 +101,55 @@
+@@ -98,56 +105,58 @@
  
  n_cpu = cpu_count()
  
@@ -207,6 +752,9 @@ index 0732d8c..13bb281 100644
 -#     if_gpu_ok = True
 -#     gpu_infos.append("%s\t%s" % ("0", "Apple GPU"))
 -#     mem.append(psutil.virtual_memory().total/ 1024 / 1024 / 1024) # 实测使用系统内存作为显存不会爆显存
+-
+-
+-v3v4set={"v3","v4"}
 +
 +
 +def _collect_accelerators():
@@ -251,18 +799,119 @@ index 0732d8c..13bb281 100644
 +
 +
 +_collect_accelerators()
++
++
++v3v4set={"v3","v4","v5turbo"}
+ def set_default():
+     global \
+         default_batch_size, \
+@@ -235,18 +244,20 @@
+     "GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s2G2333k.pth",
+     "GPT_SoVITS/pretrained_models/s2Gv3.pth",
+     "GPT_SoVITS/pretrained_models/gsv-v4-pretrained/s2Gv4.pth",
++    "GPT_SoVITS/pretrained_models/gsv-v5-pretrained/s2Gv5turbo.pth",
+ ]
+ pretrained_gpt_name = [
+     "GPT_SoVITS/pretrained_models/s1bert25hz-2kh-longer-epoch=68e-step=50232.ckpt",
+     "GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s1bert25hz-5kh-longer-epoch=12-step=369668.ckpt",
+     "GPT_SoVITS/pretrained_models/s1v3.ckpt",
+     "GPT_SoVITS/pretrained_models/s1v3.ckpt",
++    "GPT_SoVITS/pretrained_models/s1v3.ckpt",
+ ]
  
- 
- v3v4set={"v3","v4"}
-@@ -1492,7 +1497,7 @@
+ pretrained_model_list = (
+-    pretrained_sovits_name[int(version[-1]) - 1],
+-    pretrained_sovits_name[int(version[-1]) - 1].replace("s2G", "s2D"),
+-    pretrained_gpt_name[int(version[-1]) - 1],
++    pretrained_sovits_name[vindex(version)],
++    pretrained_sovits_name[vindex(version)].replace("s2G", "s2D"),
++    pretrained_gpt_name[vindex(version)],
+     "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large",
+     "GPT_SoVITS/pretrained_models/chinese-hubert-base",
+ )
+@@ -628,7 +639,7 @@
+         data["train"]["lora_rank"] = lora_rank
+         data["model"]["version"] = version
+         data["data"]["exp_dir"] = data["s2_ckpt_dir"] = s2_dir
+-        data["save_weight_dir"] = SoVITS_weight_root[int(version[-1]) - 1]
++        data["save_weight_dir"] = SoVITS_weight_root[vindex(version)]
+         data["name"] = exp_name
+         data["version"] = version
+         tmp_config_path = "%s/tmp_s2.json" % tmp
+@@ -709,7 +720,7 @@
+         data["train"]["if_save_every_weights"] = if_save_every_weights
+         data["train"]["if_save_latest"] = if_save_latest
+         data["train"]["if_dpo"] = if_dpo
+-        data["train"]["half_weights_save_dir"] = GPT_weight_root[int(version[-1]) - 1]
++        data["train"]["half_weights_save_dir"] = GPT_weight_root[vindex(version)]
+         data["train"]["exp_name"] = exp_name
+         data["train_semantic_path"] = "%s/6-name2semantic.tsv" % s1_dir
+         data["train_phoneme_path"] = "%s/2-name2text.txt" % s1_dir
+@@ -1295,17 +1306,17 @@
+     os.environ["version"] = version_
+     global version
+     version = version_
+-    if pretrained_sovits_name[int(version[-1]) - 1] != "" and pretrained_gpt_name[int(version[-1]) - 1] != "":
++    if pretrained_sovits_name[vindex(version)] != "" and pretrained_gpt_name[vindex(version)] != "":
+         ...
+     else:
+         gr.Warning(i18n("未下载模型") + ": " + version.upper())
+     set_default()
+     return (
+-        {"__type__": "update", "value": pretrained_sovits_name[int(version[-1]) - 1]},
+-        {"__type__": "update", "value": pretrained_sovits_name[int(version[-1]) - 1].replace("s2G", "s2D")},
+-        {"__type__": "update", "value": pretrained_gpt_name[int(version[-1]) - 1]},
+-        {"__type__": "update", "value": pretrained_gpt_name[int(version[-1]) - 1]},
+-        {"__type__": "update", "value": pretrained_sovits_name[int(version[-1]) - 1]},
++        {"__type__": "update", "value": pretrained_sovits_name[vindex(version)]},
++        {"__type__": "update", "value": pretrained_sovits_name[vindex(version)].replace("s2G", "s2D")},
++        {"__type__": "update", "value": pretrained_gpt_name[vindex(version)]},
++        {"__type__": "update", "value": pretrained_gpt_name[vindex(version)]},
++        {"__type__": "update", "value": pretrained_sovits_name[vindex(version)]},
+         {"__type__": "update", "value": default_batch_size, "maximum": default_max_batch_size},
+         {"__type__": "update", "value": default_sovits_epoch, "maximum": max_sovits_epoch},
+         {"__type__": "update", "value": default_sovits_save_every_epoch, "maximum": max_sovits_save_every_epoch},
+@@ -1492,11 +1503,11 @@
                  with gr.Row():
                      exp_name = gr.Textbox(label=i18n("*实验/模型名"), value="xxx", interactive=True)
                      gpu_info = gr.Textbox(label=i18n("显卡信息"), value=gpu_info, visible=True, interactive=False)
 -                    version_checkbox = gr.Radio(label=i18n("版本"), value=version, choices=["v1", "v2", "v4"])#, "v3"
-+                    version_checkbox = gr.Radio(label=i18n("版本"), value=version, choices=["v4"], interactive=False)
++                    version_checkbox = gr.Radio(label=i18n("版本"), value=version, choices=["v4", "v5turbo"], interactive=True)
                  with gr.Row():
                      pretrained_s2G = gr.Textbox(
                          label=i18n("预训练SoVITS-G模型路径"),
+-                        value=pretrained_sovits_name[int(version[-1]) - 1],
++                        value=pretrained_sovits_name[vindex(version)],
+                         interactive=True,
+                         lines=2,
+                         max_lines=3,
+@@ -1504,7 +1515,7 @@
+                     )
+                     pretrained_s2D = gr.Textbox(
+                         label=i18n("预训练SoVITS-D模型路径"),
+-                        value=pretrained_sovits_name[int(version[-1]) - 1].replace("s2G", "s2D"),
++                        value=pretrained_sovits_name[vindex(version)].replace("s2G", "s2D"),
+                         interactive=True,
+                         lines=2,
+                         max_lines=3,
+@@ -1512,7 +1523,7 @@
+                     )
+                     pretrained_s1 = gr.Textbox(
+                         label=i18n("预训练GPT模型路径"),
+-                        value=pretrained_gpt_name[int(version[-1]) - 1],
++                        value=pretrained_gpt_name[vindex(version)],
+                         interactive=True,
+                         lines=2,
+                         max_lines=3,
+@@ -1601,7 +1612,7 @@
+                     with gr.Row():
+                         pretrained_s2G_ = gr.Textbox(
+                             label=i18n("预训练SoVITS-G模型路径"),
+-                            value=pretrained_sovits_name[int(version[-1]) - 1],
++                            value=pretrained_sovits_name[vindex(version)],
+                             interactive=False,
+                             lines=2,
+                         )
 diff --git a/GPT_SoVITS/AR/models/t2s_lightning_module.py b/GPT_SoVITS/AR/models/t2s_lightning_module.py
 index eb946ca..b7e995e 100644
 --- a/GPT_SoVITS/AR/models/t2s_lightning_module.py
@@ -286,10 +935,18 @@ index 8579a63..230a50d 100644
 +# Keep package import lightweight so device_utils can be imported without
 +# pulling in torch/IPEX-dependent modules. Submodules are imported on demand.
 diff --git a/GPT_SoVITS/TTS_infer_pack/TTS.py b/GPT_SoVITS/TTS_infer_pack/TTS.py
-index d20daee..b8d9130 100644
+index d20daee..fda786b 100644
 --- a/GPT_SoVITS/TTS_infer_pack/TTS.py
 +++ b/GPT_SoVITS/TTS_infer_pack/TTS.py
-@@ -35,6 +35,7 @@
+@@ -26,6 +26,7 @@
+ from feature_extractor.cnhubert import CNHubert
+ from module.mel_processing import mel_spectrogram_torch, spectrogram_torch
+ from module.models import SynthesizerTrn, SynthesizerTrnV3, Generator
++from module.models_v5 import synthesize_v5_mel, V5_VERSIONS
+ from peft import LoraConfig, get_peft_model
+ from process_ckpt import get_sovits_version_from_path_fast, load_sovits_new
+ from transformers import AutoModelForMaskedLM, AutoTokenizer
+@@ -35,6 +36,7 @@
  from tools.my_utils import load_audio
  from TTS_infer_pack.text_segmentation_method import splits
  from TTS_infer_pack.TextPreprocessor import TextPreprocessor
@@ -297,7 +954,27 @@ index d20daee..b8d9130 100644
  
  language = os.environ.get("language", "Auto")
  language = sys.argv[-1] if sys.argv[-1] in scan_language_list() else language
-@@ -292,10 +293,7 @@
+@@ -252,8 +254,13 @@
+             "cnhuhbert_base_path": "GPT_SoVITS/pretrained_models/chinese-hubert-base",
+             "bert_base_path": "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large",
+         },
+-
+     }
++    for v5_variant in V5_VERSIONS:
++        default_configs[v5_variant] = dict(
++            default_configs["v4"],
++            version=v5_variant,
++            vits_weights_path=f"GPT_SoVITS/pretrained_models/gsv-v5-pretrained/s2G{v5_variant}.pth",
++        )
+     configs: dict = None
+     v1_languages: list = ["auto", "en", "zh", "ja", "all_zh", "all_ja"]
+     v2_languages: list = ["auto", "auto_yue", "en", "zh", "ja", "yue", "ko", "all_zh", "all_ja", "all_yue", "all_ko"]
+@@ -288,14 +295,11 @@
+ 
+         assert isinstance(configs, dict)
+         version = configs.get("version", "v2").lower()
+-        assert version in ["v1", "v2", "v3", "v4"]
++        assert version in ["v1", "v2", "v3", "v4", "v5dev", "v5turbo"]
          self.default_configs[version] = configs.get(version, self.default_configs[version])
          self.configs: dict = configs.get("custom", deepcopy(self.default_configs[version]))
  
@@ -309,7 +986,55 @@ index d20daee..b8d9130 100644
  
          self.is_half = self.configs.get("is_half", False)
          # if str(self.device) == "cpu" and self.is_half:
-@@ -671,12 +669,13 @@
+@@ -482,7 +486,15 @@
+             hps["model"]["version"] = "v1"
+         else:
+             hps["model"]["version"] = "v2"
+-        # version = hps["model"]["version"]
++        version = hps["model"]["version"]
++        v3v4set = {"v3", "v4"} | V5_VERSIONS
++        if model_version not in v3v4set:
++            if "Pro" not in model_version:
++                model_version = version
++            else:
++                hps["model"]["version"] = model_version
++        else:
++            hps["model"]["version"] = model_version
+ 
+         self.configs.filter_length = hps["data"]["filter_length"]
+         self.configs.segment_size = hps["train"]["segment_size"]
+@@ -498,7 +510,7 @@
+ 
+         # print(f"model_version:{model_version}")
+         # print(f'hps["model"]["version"]:{hps["model"]["version"]}')
+-        if model_version not in {"v3", "v4"}:
++        if model_version not in v3v4set:
+             vits_model = SynthesizerTrn(
+                 self.configs.filter_length // 2 + 1,
+                 self.configs.segment_size // self.configs.hop_length,
+@@ -586,7 +598,7 @@
+             self.vocoder_configs["upsample_rate"] = 256
+             self.vocoder_configs["overlapped_len"] = 12
+ 
+-        elif version == "v4":
++        elif version in ({"v4"} | V5_VERSIONS):
+             if self.vocoder is not None and self.vocoder.__class__.__name__ == "Generator":
+                 return
+             if self.vocoder is not None:
+@@ -605,7 +617,11 @@
+                         gin_channels=0, is_bias=True
+                     )
+             self.vocoder.remove_weight_norm()
+-            state_dict_g = torch.load("%s/GPT_SoVITS/pretrained_models/gsv-v4-pretrained/vocoder.pth" % (now_dir,), map_location="cpu")
++            vocoder_dir = "gsv-v5-pretrained" if version in V5_VERSIONS else "gsv-v4-pretrained"
++            state_dict_g = torch.load(
++                "%s/GPT_SoVITS/pretrained_models/%s/vocoder.pth" % (now_dir, vocoder_dir),
++                map_location="cpu", weights_only=False,
++            )
+             print("loading vocoder",self.vocoder.load_state_dict(state_dict_g))
+ 
+             self.vocoder_configs["sr"] = 48000
+@@ -671,12 +687,13 @@
              if self.vocoder is not None:
                  self.vocoder = self.vocoder.float()
  
@@ -325,7 +1050,7 @@ index d20daee..b8d9130 100644
          self.configs.device = device
          if save:
              self.configs.save_configs()
-@@ -700,9 +699,18 @@
+@@ -700,9 +717,18 @@
          Args:
              ref_audio_path: str, the path of the reference audio.
          """
@@ -344,7 +1069,35 @@ index d20daee..b8d9130 100644
  
      def _set_ref_audio_path(self, ref_audio_path):
          self.prompt_cache["ref_audio_path"] = ref_audio_path
-@@ -1298,10 +1306,7 @@
+@@ -955,7 +981,7 @@
+                     "seed": -1,                   # int. random seed for reproducibility.
+                     "parallel_infer": True,       # bool. whether to use parallel inference.
+                     "repetition_penalty": 1.35    # float. repetition penalty for T2S model.
+-                    "sample_steps": 32,           # int. number of sampling steps for VITS model V3.
++                    "sample_steps": 32,           # int. VITS sampling steps (4 for v5turbo).
+                     "super_sampling": False,       # bool. whether to use super-sampling for audio when using VITS model V3.
+                 }
+         returns:
+@@ -984,7 +1010,8 @@
+         actual_seed = set_seed(seed)
+         parallel_infer = inputs.get("parallel_infer", True)
+         repetition_penalty = inputs.get("repetition_penalty", 1.35)
+-        sample_steps = inputs.get("sample_steps", 32)
++        sample_steps = inputs.get("sample_steps")
++        sample_steps = (4 if self.configs.version == "v5turbo" else 32) if sample_steps is None else int(sample_steps)
+         super_sampling = inputs.get("super_sampling", False)
+ 
+         if parallel_infer:
+@@ -1024,7 +1051,7 @@
+             assert prompt_lang in self.configs.languages
+ 
+         if no_prompt_text and self.configs.use_vocoder:
+-            raise NO_PROMPT_ERROR("prompt_text cannot be empty when using SoVITS_V3")
++            raise NO_PROMPT_ERROR("prompt_text cannot be empty when using SoVITS V3/V4/V5")
+ 
+         if ref_audio_path in [None, ""] and (
+             (self.prompt_cache["prompt_semantic"] is None) or (self.prompt_cache["refer_spec"] in [None, []])
+@@ -1298,10 +1325,7 @@
      def empty_cache(self):
          try:
              gc.collect()  # 触发gc的垃圾回收。避免内存一直增长。
@@ -356,6 +1109,55 @@ index d20daee..b8d9130 100644
          except:
              pass
  
+@@ -1360,8 +1384,11 @@
+         return sr, audio
+ 
+     def using_vocoder_synthesis(
+-        self, semantic_tokens: torch.Tensor, phones: torch.Tensor, speed: float = 1.0, sample_steps: int = 32
++        self, semantic_tokens: torch.Tensor, phones: torch.Tensor, speed: float = 1.0,
++        sample_steps: int = None, cfg_rate: float = None,
+     ):
++        sample_steps = (4 if self.configs.version == "v5turbo" else 32) if sample_steps is None else int(sample_steps)
++        cfg_rate = 0.0 if cfg_rate is None else float(cfg_rate)
+         prompt_semantic_tokens = self.prompt_cache["prompt_semantic"].unsqueeze(0).unsqueeze(0).to(self.configs.device)
+         prompt_phones = torch.LongTensor(self.prompt_cache["phones"]).unsqueeze(0).to(self.configs.device)
+         refer_audio_spec = self.prompt_cache["refer_spec"][0].to(dtype=self.precision, device=self.configs.device)
+@@ -1380,6 +1407,13 @@
+ 
+         mel2 = mel_fn(ref_audio) if self.configs.version == "v3" else mel_fn_v4(ref_audio)
+         mel2 = norm_spec(mel2)
++        if self.configs.version in V5_VERSIONS:
++            fea_todo, _ = self.vits_model.decode_encp(semantic_tokens, phones, refer_audio_spec, ge, speed)
++            mel = synthesize_v5_mel(
++                self.vits_model, fea_ref, fea_todo, mel2.to(self.precision), sample_steps, cfg_rate
++            )
++            with torch.inference_mode():
++                return self.vocoder(denorm_spec(mel).to(self.precision))[0, 0]
+         T_min = min(mel2.shape[2], fea_ref.shape[2])
+         mel2 = mel2[:, :, :T_min]
+         fea_ref = fea_ref[:, :, :T_min]
+@@ -1427,8 +1461,20 @@
+         semantic_tokens_list: List[torch.Tensor],
+         batch_phones: List[torch.Tensor],
+         speed: float = 1.0,
+-        sample_steps: int = 32,
++        sample_steps: int = None,
++        cfg_rate: float = None,
+     ) -> List[torch.Tensor]:
++        sample_steps = (4 if self.configs.version == "v5turbo" else 32) if sample_steps is None else int(sample_steps)
++        cfg_rate = 0.0 if cfg_rate is None else float(cfg_rate)
++        if self.configs.version in V5_VERSIONS:
++            return [
++                self.using_vocoder_synthesis(
++                    semantic_tokens_list[i][-idx:].unsqueeze(0).unsqueeze(0),
++                    batch_phones[i].unsqueeze(0).to(self.configs.device),
++                    speed=speed, sample_steps=sample_steps, cfg_rate=cfg_rate,
++                )
++                for i, idx in enumerate(idx_list)
++            ]
+         prompt_semantic_tokens = self.prompt_cache["prompt_semantic"].unsqueeze(0).unsqueeze(0).to(self.configs.device)
+         prompt_phones = torch.LongTensor(self.prompt_cache["phones"]).unsqueeze(0).to(self.configs.device)
+         refer_audio_spec = self.prompt_cache["refer_spec"][0].to(dtype=self.precision, device=self.configs.device)
 diff --git a/GPT_SoVITS/TTS_infer_pack/TextPreprocessor.py b/GPT_SoVITS/TTS_infer_pack/TextPreprocessor.py
 index 426929f..9b9f39a 100644
 --- a/GPT_SoVITS/TTS_infer_pack/TextPreprocessor.py
@@ -379,11 +1181,11 @@ index 426929f..9b9f39a 100644
          print(text)
  
 diff --git a/GPT_SoVITS/configs/tts_infer.yaml b/GPT_SoVITS/configs/tts_infer.yaml
-index 20c41a2..de71029 100644
+index 20c41a2..c08ffe7 100644
 --- a/GPT_SoVITS/configs/tts_infer.yaml
 +++ b/GPT_SoVITS/configs/tts_infer.yaml
 @@ -1,11 +1,12 @@
-+version: v4
++version: v5turbo
  custom:
    bert_base_path: GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large
    cnhuhbert_base_path: GPT_SoVITS/pretrained_models/chinese-hubert-base
@@ -394,13 +1196,238 @@ index 20c41a2..de71029 100644
 -  version: v2
 -  vits_weights_path: GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s2G2333k.pth
 +  t2s_weights_path: GPT_SoVITS/pretrained_models/s1v3.ckpt
-+  version: v4
-+  vits_weights_path: GPT_SoVITS/pretrained_models/gsv-v4-pretrained/s2Gv4.pth
++  version: v5turbo
++  vits_weights_path: GPT_SoVITS/pretrained_models/gsv-v5-pretrained/s2Gv5turbo.pth
  v1:
    bert_base_path: GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large
    cnhuhbert_base_path: GPT_SoVITS/pretrained_models/chinese-hubert-base
+@@ -38,3 +39,11 @@
+   t2s_weights_path: GPT_SoVITS/pretrained_models/s1v3.ckpt
+   version: v4
+   vits_weights_path: GPT_SoVITS/pretrained_models/gsv-v4-pretrained/s2Gv4.pth
++v5turbo:
++  bert_base_path: GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large
++  cnhuhbert_base_path: GPT_SoVITS/pretrained_models/chinese-hubert-base
++  device: cpu
++  is_half: false
++  t2s_weights_path: GPT_SoVITS/pretrained_models/s1v3.ckpt
++  version: v5turbo
++  vits_weights_path: GPT_SoVITS/pretrained_models/gsv-v5-pretrained/s2Gv5turbo.pth
+diff --git a/GPT_SoVITS/f5_tts/model/__init__.py b/GPT_SoVITS/f5_tts/model/__init__.py
+index 50cff99..4584614 100644
+--- a/GPT_SoVITS/f5_tts/model/__init__.py
++++ b/GPT_SoVITS/f5_tts/model/__init__.py
+@@ -1,13 +1 @@
+-# from f5_tts.model.cfm import CFM
+-#
+-# from f5_tts.model.backbones.unett import UNetT
+ from GPT_SoVITS.f5_tts.model.backbones.dit import DiT
+-# from f5_tts.model.backbones.dit import DiTNoCond
+-# from f5_tts.model.backbones.dit import DiTNoCondNoT
+-# from f5_tts.model.backbones.mmdit import MMDiT
+-
+-# from f5_tts.model.trainer import Trainer
+-
+-
+-# __all__ = ["CFM", "UNetT", "DiT", "MMDiT", "Trainer"]
+-# __all__ = ["CFM", "UNetT", "DiTNoCond","DiT", "MMDiT"]
+diff --git a/GPT_SoVITS/f5_tts/model/backbones/dit.py b/GPT_SoVITS/f5_tts/model/backbones/dit.py
+index 7d98a85..2c3ebf2 100644
+--- a/GPT_SoVITS/f5_tts/model/backbones/dit.py
++++ b/GPT_SoVITS/f5_tts/model/backbones/dit.py
+@@ -11,6 +11,7 @@
+ 
+ import torch
+ from torch import nn
++import torch.nn.functional as F
+ from torch.utils.checkpoint import checkpoint
+ 
+ from x_transformers.x_transformers import RotaryEmbedding
+@@ -99,11 +100,12 @@
+         text_dim=None,
+         conv_layers=0,
+         long_skip_connection=False,
++        use_step_embedding=True,
+     ):
+         super().__init__()
+ 
+         self.time_embed = TimestepEmbedding(dim)
+-        self.d_embed = TimestepEmbedding(dim)
++        self.d_embed = TimestepEmbedding(dim) if use_step_embedding else None
+         if text_dim is None:
+             text_dim = mel_dim
+         self.text_embed = TextEmbedding(text_dim, conv_layers=conv_layers)
+@@ -129,6 +131,28 @@
+             return outputs
+ 
+         return ckpt_forward
++
++    def prepare_static_cache(self, cond0, x_lens, text0):
++        text = text0.transpose(2, 1)
++        cond = cond0.transpose(2, 1)
++        seq_len = cond.shape[1]
++        text_embed = self.text_embed(text, seq_len, drop_text=False)
++        projection = self.input_embed.proj
++        mel_dim = cond.shape[-1]
++        static = F.linear(
++            torch.cat((cond, text_embed), dim=-1),
++            projection.weight[:, mel_dim:], projection.bias,
++        )
++        negative_static = F.linear(
++            torch.cat((torch.zeros_like(cond), text_embed), dim=-1),
++            projection.weight[:, mel_dim:], projection.bias,
++        )
++        return {
++            "condition": static,
++            "negative_condition": negative_static,
++            "mask": sequence_mask(x_lens, max_length=seq_len).to(cond.device),
++            "rope": self.rotary_embed.forward_from_seq_len(seq_len),
++        }
+ 
+     def forward(  # x, prompt_x, x_lens, t, style,cond
+         self,  # d is channel,n is T
+@@ -136,18 +160,74 @@
+         cond0: float["b n d"],  # masked cond audio  # noqa: F722
+         x_lens,
+         time: float["b"] | float[""],  # time step  # noqa: F821 F722
+-        dt_base_bootstrap,
+-        text0,  # : int["b nt"]  # noqa: F722#####condition feature
++        dt_base_bootstrap=None,
++        text0=None,  # : int["b nt"]  # noqa: F722#####condition feature
+         use_grad_ckpt=False,  # bool
+         ###no-use
+         drop_audio_cond=False,  # cfg for cond audio
+         drop_text=False,  # cfg for text
+         # mask: bool["b n"] | None = None,  # noqa: F722
++        infer=False,  # bool
++        text_cache=None,  # torch tensor as text_embed
++        dt_cache=None,  # torch tensor as dt
++        static_cache=None,
++        # cache-dit / DBCache (see module/cache_dit.py). `dbcache=None` => untouched path.
++        dbcache=None,  # module.cache_dit.DBCacheState
++        dbcache_branch=0,  # 0 = CFG positive, 1 = CFG negative
+     ):
++        x, t, mask, rope, text_embed, dt = self.trunk(
++            x0, cond0, x_lens, time, dt_base_bootstrap=dt_base_bootstrap, text0=text0,
++            drop_audio_cond=drop_audio_cond, drop_text=drop_text, infer=infer,
++            text_cache=text_cache, dt_cache=dt_cache, static_cache=static_cache,
++        )
++
++        residual = x
++        if self.long_skip_connection is None:
++            residual = None
++
++        if dbcache is None or not dbcache.enabled:
++            # ---- original path: all blocks, then head ------------------------------
++            x = self.run_blocks(x, t, mask, rope, 0, self.depth, use_grad_ckpt)
++        else:
++            # ---- cache-dit: front -> (hit: head only | miss: mid -> head) -----------
++            fn = max(0, min(int(dbcache.fn), self.depth - 1))
++            x_f = self.run_blocks(x, t, mask, rope, 0, fn, use_grad_ckpt)
++            fd = dbcache.front_update(dbcache_branch, x_f, x)
++            if dbcache.can_cache(dbcache_branch, fd):
++                x = x_f + dbcache.mid_residual(dbcache_branch)
++                dbcache.on_hit(dbcache_branch)
++                if dbcache.trace:
++                    print("[dbcache] step=%d HIT  fd=%.5f (hits=%d misses=%d)"
++                          % (dbcache.step, fd, dbcache.branch(dbcache_branch).hits,
++                             dbcache.branch(dbcache_branch).misses), flush=True)
++            else:
++                x = self.run_blocks(x_f, t, mask, rope, fn, self.depth, use_grad_ckpt)
++                dbcache.on_miss(dbcache_branch, x, x_f)
++                if dbcache.trace:
++                    print("[dbcache] step=%d MISS fd=%.5f (hits=%d misses=%d)"
++                          % (dbcache.step, fd, dbcache.branch(dbcache_branch).hits,
++                             dbcache.branch(dbcache_branch).misses), flush=True)
++
++        output = self.head(x, t, residual)
++
++        if infer:
++            return output, text_embed if static_cache is None else None, dt
++        else:
++            return output
++
++    # ---------------------------------------------------------------------------------
++    # Three-segment split used by cache-dit; the weights are shared, nothing is copied.
++    # ---------------------------------------------------------------------------------
++    def trunk(self, x0, cond0, x_lens, time, dt_base_bootstrap=None, text0=None,
++              drop_audio_cond=False, drop_text=False, infer=False, text_cache=None,
++              dt_cache=None, static_cache=None):
++        """Everything before the transformer blocks: t/dt embedding + input embedding."""
++        text_embed = None
+         x = x0.transpose(2, 1)
+         cond = cond0.transpose(2, 1)
+         text = text0.transpose(2, 1)
+-        mask = sequence_mask(x_lens, max_length=x.size(1)).to(x.device)
++        mask = (static_cache["mask"] if static_cache is not None
++                else sequence_mask(x_lens, max_length=x.size(1)).to(x.device))
+ 
+         batch, seq_len = x.shape[0], x.shape[1]
+         if time.ndim == 0:
+@@ -155,26 +235,45 @@
+ 
+         # t: conditioning time, c: context (text + masked cond audio), x: noised input audio
+         t = self.time_embed(time)
+-        dt = self.d_embed(dt_base_bootstrap)
+-        t += dt
+-        text_embed = self.text_embed(text, seq_len, drop_text=drop_text)  ###need to change
+-        x = self.input_embed(x, cond, text_embed, drop_audio_cond=drop_audio_cond)
+-
+-        rope = self.rotary_embed.forward_from_seq_len(seq_len)
+-
+-        if self.long_skip_connection is not None:
+-            residual = x
+-
+-        for block in self.transformer_blocks:
++        if self.d_embed is None:
++            dt = None
++        elif infer and dt_cache is not None:
++            dt = dt_cache
++        else:
++            dt = self.d_embed(dt_base_bootstrap)
++        if dt is not None:
++            t += dt
++
++        if static_cache is not None:
++            static = static_cache["negative_condition" if drop_audio_cond else "condition"]
++            x = F.linear(x, self.input_embed.proj.weight[:, :x.shape[-1]]) + static
++            x = self.input_embed.conv_pos_embed(x, mask=mask) + x
++        elif infer and text_cache is not None:
++            text_embed = text_cache
++            x = self.input_embed(x, cond, text_embed, drop_audio_cond=drop_audio_cond)
++        else:
++            text_embed = self.text_embed(text, seq_len, drop_text=drop_text)  ###need to change
++            x = self.input_embed(x, cond, text_embed, drop_audio_cond=drop_audio_cond)
++
++        rope = (static_cache["rope"] if static_cache is not None
++                else self.rotary_embed.forward_from_seq_len(seq_len))
++
++        return x, t, mask, rope, text_embed, dt
++
++    def run_blocks(self, x, t, mask, rope, start=0, end=None, use_grad_ckpt=False):
++        """`front` is blocks[0:fn], `mid` is blocks[fn:depth]."""
++        end = self.depth if end is None else end
++        for block in self.transformer_blocks[start:end]:
+             if use_grad_ckpt:
+                 x = checkpoint(self.ckpt_wrapper(block), x, t, mask, rope, use_reentrant=False)
+             else:
+                 x = block(x, t, mask=mask, rope=rope)
+-
++        return x
++
++    def head(self, x, t, residual=None):
++        """`norm_out -> proj_out`, computed on every step, hits included."""
+         if self.long_skip_connection is not None:
+             x = self.long_skip_connection(torch.cat((x, residual), dim=-1))
+-
+         x = self.norm_out(x, t)
+-        output = self.proj_out(x)
+-
+-        return output
++        return self.proj_out(x)
++
 diff --git a/GPT_SoVITS/inference_webui.py b/GPT_SoVITS/inference_webui.py
-index 047bc24..cc2e31a 100644
+index 047bc24..69e1ca9 100644
 --- a/GPT_SoVITS/inference_webui.py
 +++ b/GPT_SoVITS/inference_webui.py
 @@ -29,6 +29,7 @@
@@ -411,16 +1438,22 @@ index 047bc24..cc2e31a 100644
  os.environ["TORCH_XPU_BACKEND"] = "ipex"
  from text.LangSegmenter import LangSegmenter
  
-@@ -38,7 +39,7 @@
+@@ -38,11 +39,13 @@
      analytics.version_check = lambda: None
  except:
      ...
 -version = model_version = os.environ.get("version", "v2")
-+version = model_version = os.environ.get("version", "v4")
++version = model_version = os.environ.get("version", "v5turbo")
  path_sovits_v3 = "GPT_SoVITS/pretrained_models/s2Gv3.pth"
  path_sovits_v4 = "GPT_SoVITS/pretrained_models/gsv-v4-pretrained/s2Gv4.pth"
++path_sovits_v5turbo = "GPT_SoVITS/pretrained_models/gsv-v5-pretrained/s2Gv5turbo.pth"
  is_exist_s2gv3 = os.path.exists(path_sovits_v3)
-@@ -94,7 +95,7 @@
+ is_exist_s2gv4 = os.path.exists(path_sovits_v4)
++is_exist_s2gv5turbo = os.path.exists(path_sovits_v5turbo)
+ pretrained_sovits_name = [
+     "GPT_SoVITS/pretrained_models/s2G488k.pth",
+     "GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s2G2333k.pth",
+@@ -94,7 +97,7 @@
  is_share = eval(is_share)
  if "_XPU_VISIBLE_DEVICES" in os.environ:
      os.environ["XPU_VISIBLE_DEVICES"] = os.environ["_XPU_VISIBLE_DEVICES"]
@@ -429,7 +1462,7 @@ index 047bc24..cc2e31a 100644
  # is_half=False
  punctuation = set(["!", "?", "…", ",", ".", "-", " "])
  import gradio as gr
-@@ -118,7 +119,11 @@
+@@ -118,7 +121,11 @@
      os.environ["PYTHONHASHSEED"] = str(seed)
      np.random.seed(seed)
      torch.manual_seed(seed)
@@ -442,7 +1475,7 @@ index 047bc24..cc2e31a 100644
  
  
  # set_seed(42)
-@@ -138,10 +143,8 @@
+@@ -138,10 +145,8 @@
  
  # os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'  # 确保直接启动推理UI时也能够设置。
  
@@ -455,7 +1488,31 @@ index 047bc24..cc2e31a 100644
  
  dict_language_v1 = {
      i18n("中文"): "all_zh",  # 全部按中文识别
-@@ -414,8 +417,7 @@
+@@ -239,12 +244,12 @@
+ # symbol_version-model_version-if_lora_v3
+ from process_ckpt import get_sovits_version_from_path_fast, load_sovits_new
+ 
+-v3v4set={"v3","v4"}
++v3v4set={"v3","v4","v5turbo"}
+ def change_sovits_weights(sovits_path, prompt_language=None, text_language=None):
+     global vq_model, hps, version, model_version, dict_language, if_lora_v3
+     version, model_version, if_lora_v3 = get_sovits_version_from_path_fast(sovits_path)
+     print(sovits_path,version, model_version, if_lora_v3)
+-    is_exist=is_exist_s2gv3 if model_version=="v3"else is_exist_s2gv4
++    is_exist=(is_exist_s2gv3 if model_version=="v3" else is_exist_s2gv5turbo if model_version=="v5turbo" else is_exist_s2gv4)
+     if if_lora_v3 == True and is_exist == False:
+         info = "GPT_SoVITS/pretrained_models/s2Gv3.pth" + i18n("SoVITS %s 底模缺失，无法加载相应 LoRA 权重"%model_version)
+         gr.Warning(info)
+@@ -325,7 +330,7 @@
+     if if_lora_v3 == False:
+         print("loading sovits_%s" % model_version, vq_model.load_state_dict(dict_s2["weight"], strict=False))
+     else:
+-        path_sovits = path_sovits_v3 if model_version == "v3" else path_sovits_v4
++        path_sovits = (path_sovits_v3 if model_version == "v3" else path_sovits_v5turbo if model_version == "v5turbo" else path_sovits_v4)
+         print(
+             "loading sovits_%spretrained_G"%model_version,
+             vq_model.load_state_dict(load_sovits_new(path_sovits)["weight"], strict=False),
+@@ -414,8 +419,7 @@
      if hifigan_model:
          hifigan_model=hifigan_model.cpu()
          hifigan_model=None
@@ -465,7 +1522,7 @@ index 047bc24..cc2e31a 100644
      if is_half == True:
          bigvgan_model = bigvgan_model.half().to(device)
      else:
-@@ -440,8 +442,7 @@
+@@ -440,8 +444,7 @@
      if bigvgan_model:
          bigvgan_model=bigvgan_model.cpu()
          bigvgan_model=None
@@ -476,7 +1533,7 @@ index 047bc24..cc2e31a 100644
          hifigan_model = hifigan_model.half().to(device)
      else:
 diff --git a/GPT_SoVITS/inference_webui_fast.py b/GPT_SoVITS/inference_webui_fast.py
-index 13dbe1f..58e7314 100644
+index 13dbe1f..2ebc3be 100644
 --- a/GPT_SoVITS/inference_webui_fast.py
 +++ b/GPT_SoVITS/inference_webui_fast.py
 @@ -26,7 +26,10 @@
@@ -502,7 +1559,7 @@ index 13dbe1f..58e7314 100644
  cnhubert_base_path = os.environ.get("cnhubert_base_path", None)
  bert_path = os.environ.get("bert_path", None)
 -version = model_version = os.environ.get("version", "v2")
-+version = model_version = os.environ.get("version", "v4")
++version = model_version = os.environ.get("version", "v5turbo")
  
  import gradio as gr
  from TTS_infer_pack.text_segmentation_method import get_method
@@ -532,3 +1589,611 @@ index 13dbe1f..58e7314 100644
  
  dict_language_v1 = {
      i18n("中文"): "all_zh",  # 全部按中文识别
+@@ -196,8 +196,10 @@
+ 
+ path_sovits_v3 = "GPT_SoVITS/pretrained_models/s2Gv3.pth"
+ path_sovits_v4 = "GPT_SoVITS/pretrained_models/gsv-v4-pretrained/s2Gv4.pth"
++path_sovits_v5turbo = "GPT_SoVITS/pretrained_models/gsv-v5-pretrained/s2Gv5turbo.pth"
+ is_exist_s2gv3 = os.path.exists(path_sovits_v3)
+ is_exist_s2gv4 = os.path.exists(path_sovits_v4)
++is_exist_s2gv5turbo = os.path.exists(path_sovits_v5turbo)
+ pretrained_sovits_name = [
+     "GPT_SoVITS/pretrained_models/s2G488k.pth",
+     "GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s2G2333k.pth",
+@@ -262,13 +264,13 @@
+ 
+ from process_ckpt import get_sovits_version_from_path_fast
+ 
+-v3v4set={"v3","v4"}
++v3v4set={"v3","v4","v5turbo"}
+ def change_sovits_weights(sovits_path, prompt_language=None, text_language=None):
+     global version, model_version, dict_language, if_lora_v3
+     version, model_version, if_lora_v3 = get_sovits_version_from_path_fast(sovits_path)
+     # print(sovits_path,version, model_version, if_lora_v3)
+-    is_exist=is_exist_s2gv3 if model_version=="v3"else is_exist_s2gv4
+-    path_sovits = path_sovits_v3 if model_version == "v3" else path_sovits_v4
++    is_exist=(is_exist_s2gv3 if model_version=="v3" else is_exist_s2gv5turbo if model_version=="v5turbo" else is_exist_s2gv4)
++    path_sovits = (path_sovits_v3 if model_version == "v3" else path_sovits_v5turbo if model_version == "v5turbo" else path_sovits_v4)
+     if if_lora_v3 == True and is_exist == False:
+         info = path_sovits + i18n("SoVITS %s 底模缺失，无法加载相应 LoRA 权重"%model_version)
+         gr.Warning(info)
+diff --git a/GPT_SoVITS/module/models.py b/GPT_SoVITS/module/models.py
+index 21f60d9..1b64be0 100644
+--- a/GPT_SoVITS/module/models.py
++++ b/GPT_SoVITS/module/models.py
+@@ -10,6 +10,7 @@
+ from module import commons
+ from module import modules
+ from module import attentions
++from module.cache_dit import DBCacheMixin
+ from f5_tts.model import DiT
+ from torch.nn import Conv1d, ConvTranspose1d, Conv2d
+ from torch.nn.utils import weight_norm, remove_weight_norm, spectral_norm
+@@ -150,6 +151,8 @@
+         x = self.proj(x * x_mask)
+         return x * x_mask
+ 
++
++WINDOW = {}
+ 
+ class TextEncoder(nn.Module):
+     def __init__(
+@@ -209,7 +212,7 @@
+ 
+         self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
+ 
+-    def forward(self, y, y_lengths, text, text_lengths, ge, speed=1, test=None):
++    def forward(self, y, y_lengths, text, text_lengths, ge, speed=1, test=None, result_length:int=None, overlap_frames:torch.Tensor=None, padding_length:int=None):
+         y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, y.size(2)), 1).to(y.dtype)
+ 
+         y = self.ssl_proj(y * y_mask) * y_mask
+@@ -222,13 +225,44 @@
+         text = self.text_embedding(text).transpose(1, 2)
+         text = self.encoder_text(text * text_mask, text_mask)
+         y = self.mrte(y, y_mask, text, text_mask, ge)
++
++        if padding_length is not None and padding_length!=0:
++            y = y[:, :, :-padding_length]
++            y_mask = y_mask[:, :, :-padding_length]
++
++
+         y = self.encoder2(y * y_mask, y_mask)
++
++        if result_length is not None:
++            y = y[:, :, -result_length:]
++            y_mask = y_mask[:, :, -result_length:]
++
++        if overlap_frames is not None:
++            overlap_len = overlap_frames.shape[-1]
++            window = WINDOW.get(overlap_len, None)
++            if window is None:
++                # WINDOW[overlap_len] = torch.hann_window(overlap_len*2, device=y.device, dtype=y.dtype)
++                WINDOW[overlap_len] = torch.sin(torch.arange(overlap_len*2, device=y.device) * torch.pi / (overlap_len*2))
++                window = WINDOW[overlap_len]
++
++
++            window = window.to(y.device)
++            y[:,:,:overlap_len] = (
++                window[:overlap_len].view(1, 1, -1) * y[:,:,:overlap_len]
++                + window[overlap_len:].view(1, 1, -1) * overlap_frames
++            )
++            
++        y_ = y
++        y_mask_ = y_mask
++
++
++
+         if speed != 1:
+             y = F.interpolate(y, size=int(y.shape[-1] / speed) + 1, mode="linear")
+             y_mask = F.interpolate(y_mask, size=y.shape[-1], mode="nearest")
+         stats = self.proj(y) * y_mask
+         m, logs = torch.split(stats, self.out_channels, dim=1)
+-        return y, m, logs, y_mask
++        return y, m, logs, y_mask, y_, y_mask_
+ 
+     def extract_latent(self, x):
+         x = self.ssl_proj(x)
+@@ -414,7 +448,8 @@
+         upsample_rates,
+         upsample_initial_channel,
+         upsample_kernel_sizes,
+-        gin_channels=0,is_bias=False,
++        gin_channels=0,
++        is_bias=False,
+     ):
+         super(Generator, self).__init__()
+         self.num_kernels = len(resblock_kernel_sizes)
+@@ -586,10 +621,16 @@
+         return x, fmap
+ 
+ 
++v2pro_set = {"v2Pro", "v2ProPlus"}
++
++
+ class MultiPeriodDiscriminator(torch.nn.Module):
+-    def __init__(self, use_spectral_norm=False):
++    def __init__(self, use_spectral_norm=False, version=None):
+         super(MultiPeriodDiscriminator, self).__init__()
+-        periods = [2, 3, 5, 7, 11]
++        if version in v2pro_set:
++            periods = [2, 3, 5, 7, 11, 17, 23]
++        else:
++            periods = [2, 3, 5, 7, 11]
+ 
+         discs = [DiscriminatorS(use_spectral_norm=use_spectral_norm)]
+         discs = discs + [DiscriminatorP(i, use_spectral_norm=use_spectral_norm) for i in periods]
+@@ -885,12 +926,23 @@
+         self.quantizer = ResidualVectorQuantizer(dimension=ssl_dim, n_q=1, bins=1024)
+         self.freeze_quantizer = freeze_quantizer
+ 
+-    def forward(self, ssl, y, y_lengths, text, text_lengths):
++        self.is_v2pro = self.version in v2pro_set
++        if self.is_v2pro:
++            self.sv_emb = nn.Linear(20480, gin_channels)
++            self.ge_to512 = nn.Linear(gin_channels, 512)
++            self.prelu = nn.PReLU(num_parameters=gin_channels)
++
++    def forward(self, ssl, y, y_lengths, text, text_lengths, sv_emb=None):
+         y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, y.size(2)), 1).to(y.dtype)
+         if self.version == "v1":
+             ge = self.ref_enc(y * y_mask, y_mask)
+         else:
+             ge = self.ref_enc(y[:, :704] * y_mask, y_mask)
++        if self.is_v2pro:
++            sv_emb = self.sv_emb(sv_emb)  # B*20480->B*512
++            ge += sv_emb.unsqueeze(-1)
++            ge = self.prelu(ge)
++            ge512 = self.ge_to512(ge.transpose(2, 1)).transpose(2, 1)
+         with autocast(enabled=False):
+             maybe_no_grad = torch.no_grad() if self.freeze_quantizer else contextlib.nullcontext()
+             with maybe_no_grad:
+@@ -903,7 +955,7 @@
+         if self.semantic_frame_rate == "25hz":
+             quantized = F.interpolate(quantized, size=int(quantized.shape[-1] * 2), mode="nearest")
+ 
+-        x, m_p, logs_p, y_mask = self.enc_p(quantized, y_lengths, text, text_lengths, ge)
++        x, m_p, logs_p, y_mask, _, _ = self.enc_p(quantized, y_lengths, text, text_lengths, ge512 if self.is_v2pro else ge)
+         z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=ge)
+         z_p = self.flow(z, y_mask, g=ge)
+ 
+@@ -931,7 +983,7 @@
+         if self.semantic_frame_rate == "25hz":
+             quantized = F.interpolate(quantized, size=int(quantized.shape[-1] * 2), mode="nearest")
+ 
+-        x, m_p, logs_p, y_mask = self.enc_p(quantized, y_lengths, text, text_lengths, ge, test=test)
++        x, m_p, logs_p, y_mask, _, _ = self.enc_p(quantized, y_lengths, text, text_lengths, ge, test=test)
+         z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
+ 
+         z = self.flow(z_p, y_mask, g=ge, reverse=True)
+@@ -939,9 +991,10 @@
+         o = self.dec((z * y_mask)[:, :, :], g=ge)
+         return o, y_mask, (z, z_p, m_p, logs_p)
+ 
++
+     @torch.no_grad()
+-    def decode(self, codes, text, refer, noise_scale=0.5, speed=1):
+-        def get_ge(refer):
++    def decode(self, codes, text, refer, noise_scale=0.5, speed=1, sv_emb=None):
++        def get_ge(refer, sv_emb):
+             ge = None
+             if refer is not None:
+                 refer_lengths = torch.LongTensor([refer.size(2)]).to(refer.device)
+@@ -950,16 +1003,20 @@
+                     ge = self.ref_enc(refer * refer_mask, refer_mask)
+                 else:
+                     ge = self.ref_enc(refer[:, :704] * refer_mask, refer_mask)
++                if self.is_v2pro:
++                    sv_emb = self.sv_emb(sv_emb)  # B*20480->B*512
++                    ge += sv_emb.unsqueeze(-1)
++                    ge = self.prelu(ge)
+             return ge
+ 
+         if type(refer) == list:
+             ges = []
+-            for _refer in refer:
+-                ge = get_ge(_refer)
++            for idx, _refer in enumerate(refer):
++                ge = get_ge(_refer, sv_emb[idx] if self.is_v2pro else None)
+                 ges.append(ge)
+             ge = torch.stack(ges, 0).mean(0)
+         else:
+-            ge = get_ge(refer)
++            ge = get_ge(refer, sv_emb)
+ 
+         y_lengths = torch.LongTensor([codes.size(2) * 2]).to(codes.device)
+         text_lengths = torch.LongTensor([text.size(-1)]).to(text.device)
+@@ -967,13 +1024,75 @@
+         quantized = self.quantizer.decode(codes)
+         if self.semantic_frame_rate == "25hz":
+             quantized = F.interpolate(quantized, size=int(quantized.shape[-1] * 2), mode="nearest")
+-        x, m_p, logs_p, y_mask = self.enc_p(quantized, y_lengths, text, text_lengths, ge, speed)
++        x, m_p, logs_p, y_mask, _, _ = self.enc_p(
++            quantized,
++            y_lengths,
++            text,
++            text_lengths,
++            self.ge_to512(ge.transpose(2, 1)).transpose(2, 1) if self.is_v2pro else ge,
++            speed,
++        )
+         z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
+ 
+         z = self.flow(z_p, y_mask, g=ge, reverse=True)
+ 
+         o = self.dec((z * y_mask)[:, :, :], g=ge)
+         return o
++
++
++    @torch.no_grad()
++    def decode_streaming(self, codes, text, refer, noise_scale=0.5, speed=1, sv_emb=None, result_length:int=None, overlap_frames:torch.Tensor=None, padding_length:int=None, generator=None):
++        def get_ge(refer, sv_emb):
++            ge = None
++            if refer is not None:
++                refer_lengths = torch.LongTensor([refer.size(2)]).to(refer.device)
++                refer_mask = torch.unsqueeze(commons.sequence_mask(refer_lengths, refer.size(2)), 1).to(refer.dtype)
++                if self.version == "v1":
++                    ge = self.ref_enc(refer * refer_mask, refer_mask)
++                else:
++                    ge = self.ref_enc(refer[:, :704] * refer_mask, refer_mask)
++                if self.is_v2pro:
++                    sv_emb = self.sv_emb(sv_emb)  # B*20480->B*512
++                    ge += sv_emb.unsqueeze(-1)
++                    ge = self.prelu(ge)
++            return ge
++
++        if type(refer) == list:
++            ges = []
++            for idx, _refer in enumerate(refer):
++                ge = get_ge(_refer, sv_emb[idx] if self.is_v2pro else None)
++                ges.append(ge)
++            ge = torch.stack(ges, 0).mean(0)
++        else:
++            ge = get_ge(refer, sv_emb)
++
++        y_lengths = torch.LongTensor([codes.size(2) * 2]).to(codes.device)
++        text_lengths = torch.LongTensor([text.size(-1)]).to(text.device)
++
++        quantized = self.quantizer.decode(codes)
++        if self.semantic_frame_rate == "25hz":
++            quantized = F.interpolate(quantized, size=int(quantized.shape[-1] * 2), mode="nearest")
++            result_length = (2*result_length) if result_length is not None else None
++            padding_length = (2*padding_length) if padding_length is not None else None
++        x, m_p, logs_p, y_mask, y_, y_mask_ = self.enc_p(
++            quantized,
++            y_lengths,
++            text,
++            text_lengths,
++            self.ge_to512(ge.transpose(2, 1)).transpose(2, 1) if self.is_v2pro else ge,
++            speed,
++            result_length=result_length, 
++            overlap_frames=overlap_frames, 
++            padding_length=padding_length
++            )
++        noise = (torch.randn_like(m_p) if generator is None else
++                 torch.randn(m_p.shape, device=m_p.device, dtype=m_p.dtype, generator=generator))
++        z_p = m_p + noise * torch.exp(logs_p) * noise_scale
++
++        z = self.flow(z_p, y_mask, g=ge, reverse=True)
++
++        o = self.dec((z * y_mask)[:, :, :], g=ge)
++        return o, y_, y_mask_
+ 
+     def extract_latent(self, x):
+         ssl = self.ssl_proj(x)
+@@ -981,7 +1100,7 @@
+         return codes.transpose(0, 1)
+ 
+ 
+-class CFM(torch.nn.Module):
++class CFM(DBCacheMixin, torch.nn.Module):
+     def __init__(self, in_channels, dit):
+         super().__init__()
+         self.sigma_min = 1e-6
+@@ -992,11 +1111,20 @@
+ 
+         self.criterion = torch.nn.MSELoss()
+ 
++        self.use_conditioner_cache = True
++        self.use_static_cache = False
++        self.use_step_embedding = True
++        self.cfg_drop_text = True
++        self.noise_temperature = None
++
+     @torch.inference_mode()
+-    def inference(self, mu, x_lens, prompt, n_timesteps, temperature=1.0, inference_cfg_rate=0):
++    def inference(self, mu, x_lens, prompt, n_timesteps, temperature=1.0, inference_cfg_rate=0, generator=None):
+         """Forward diffusion"""
++        n_timesteps, inference_cfg_rate = int(n_timesteps), float(inference_cfg_rate)
+         B, T = mu.size(0), mu.size(1)
+-        x = torch.randn([B, self.in_channels, T], device=mu.device, dtype=mu.dtype) * temperature
++        if self.noise_temperature is not None:
++            temperature = self.noise_temperature
++        x = torch.randn([B, self.in_channels, T], device=mu.device, dtype=mu.dtype, generator=generator) * temperature
+         prompt_len = prompt.size(-1)
+         prompt_x = torch.zeros_like(x, dtype=mu.dtype)
+         prompt_x[..., :prompt_len] = prompt[..., :prompt_len]
+@@ -1004,29 +1132,67 @@
+         mu = mu.transpose(2, 1)
+         t = 0
+         d = 1 / n_timesteps
++        text_cache = None
++        text_cfg_cache = None
++        dt_cache = None
++        static_cache = (self.estimator.prepare_static_cache(prompt_x, x_lens, mu)
++                        if self.use_conditioner_cache and self.use_static_cache else None)
++        d_tensor = (torch.ones(x.shape[0], device=x.device, dtype=mu.dtype) * d
++                    if self.use_step_embedding else None)
++        # cache-dit: one fresh state per sampling run; None when the switch is off
++        dbcache = self._dbcache_begin(n_timesteps, T, prompt_len, x_lens, x.device)
+         for j in range(n_timesteps):
+-            t_tensor = torch.ones(x.shape[0], device=x.device, dtype=mu.dtype) * t
+-            d_tensor = torch.ones(x.shape[0], device=x.device, dtype=mu.dtype) * d
+-            # v_pred = model(x, t_tensor, d_tensor, **extra_args)
+-            v_pred = self.estimator(
+-                x, prompt_x, x_lens, t_tensor, d_tensor, mu, use_grad_ckpt=False, drop_audio_cond=False, drop_text=False
+-            ).transpose(2, 1)
++            if dbcache is not None:
++                dbcache.step_begin(j)
++            t_tensor = torch.ones(x.shape[0], device=x.device, dtype=mu.dtype) * (t if self.use_step_embedding else j * d)
++            step_condition = {"dt_base_bootstrap": d_tensor, "dt_cache": dt_cache} if self.use_step_embedding else {}
++            v_pred, text_emb, dt = self.estimator(
++                x,
++                prompt_x,
++                x_lens,
++                t_tensor,
++                text0=mu,
++                use_grad_ckpt=False,
++                drop_audio_cond=False,
++                drop_text=False,
++                infer=True,
++                text_cache=text_cache,
++                static_cache=static_cache,
++                dbcache=dbcache,
++                dbcache_branch=0,
++                **step_condition,
++            )
++            v_pred = v_pred.transpose(2, 1)
++            if self.use_conditioner_cache:
++                text_cache = text_emb
++                dt_cache = dt
++                if self.use_step_embedding:
++                    step_condition["dt_cache"] = dt_cache
+             if inference_cfg_rate > 1e-5:
+-                neg = self.estimator(
++                neg, text_cfg_emb, _ = self.estimator(
+                     x,
+                     prompt_x,
+                     x_lens,
+                     t_tensor,
+-                    d_tensor,
+-                    mu,
++                    text0=mu,
+                     use_grad_ckpt=False,
+                     drop_audio_cond=True,
+-                    drop_text=True,
+-                ).transpose(2, 1)
++                    drop_text=self.cfg_drop_text,
++                    infer=True,
++                    text_cache=text_cfg_cache if self.cfg_drop_text else text_cache,
++                    static_cache=static_cache,
++                    dbcache=dbcache,
++                    dbcache_branch=1,
++                    **step_condition,
++                )
++                neg = neg.transpose(2, 1)
++                if self.use_conditioner_cache:
++                    text_cfg_cache = text_cfg_emb
+                 v_pred = v_pred + (v_pred - neg) * inference_cfg_rate
+             x = x + d * v_pred
+             t = t + d
+             x[:, :, :prompt_len] = 0
++        self._dbcache_end(dbcache)
+         return x
+ 
+     def forward(self, x1, x_lens, prompt_lens, mu, use_grad_ckpt):
+@@ -1147,10 +1313,13 @@
+         self.bridge = nn.Sequential(nn.Conv1d(inter_channels, inter_channels2, 1, stride=1), nn.LeakyReLU())
+         self.wns1 = Encoder(inter_channels2, inter_channels2, inter_channels2, 5, 1, 8, gin_channels=gin_channels)
+         self.linear_mel = nn.Conv1d(inter_channels2, 100, 1, stride=1)
+-        self.cfm = CFM(
+-            100,
+-            DiT(**dict(dim=1024, depth=22, heads=16, ff_mult=2, text_dim=inter_channels2, conv_layers=4)),
+-        )  # text_dim is condition feature dim
++        dit = DiT(**dict(dim=1024, depth=22, heads=16, ff_mult=2, text_dim=inter_channels2,
++                         conv_layers=4, use_step_embedding=version not in {"v5dev", "v5turbo"}))
++        if version in {"v5dev", "v5turbo"}:
++            from module.models_v5 import CFMV5
++            self.cfm = CFMV5(100, dit)
++        else:
++            self.cfm = CFM(100, dit)
+         if self.freeze_quantizer == True:
+             set_no_grad(self.ssl_proj)
+             set_no_grad(self.quantizer)
+@@ -1171,9 +1340,9 @@
+                 ssl = self.ssl_proj(ssl)
+                 quantized, codes, commit_loss, quantized_list = self.quantizer(ssl, layers=[0])
+                 quantized = F.interpolate(quantized, scale_factor=2, mode="nearest")  ##BCT
+-                x, m_p, logs_p, y_mask = self.enc_p(quantized, y_lengths, text, text_lengths, ge)
++                x, m_p, logs_p, y_mask, y_, y_mask_ = self.enc_p(quantized, y_lengths, text, text_lengths, ge)
+         fea = self.bridge(x)
+-        fea = F.interpolate(fea, scale_factor=(1.875 if self.version=="v3"else 2), mode="nearest")  ##BCT
++        fea = F.interpolate(fea, scale_factor=(1.875 if self.version == "v3" else 2), mode="nearest")  ##BCT
+         fea, y_mask_ = self.wns1(
+             fea, mel_lengths, ge
+         )  ##If the 1-minute fine-tuning works fine, no need to manually adjust the learning rate.
+@@ -1196,18 +1365,18 @@
+             ge = self.ref_enc(refer[:, :704] * refer_mask, refer_mask)
+         y_lengths = torch.LongTensor([int(codes.size(2) * 2)]).to(codes.device)
+         if speed == 1:
+-            sizee = int(codes.size(2) * (3.875 if self.version=="v3"else 4))
++            sizee = int(codes.size(2) * (3.875 if self.version == "v3" else 4))
+         else:
+-            sizee = int(codes.size(2) * (3.875 if self.version=="v3"else 4) / speed) + 1
++            sizee = int(codes.size(2) * (3.875 if self.version == "v3" else 4) / speed) + 1
+         y_lengths1 = torch.LongTensor([sizee]).to(codes.device)
+         text_lengths = torch.LongTensor([text.size(-1)]).to(text.device)
+ 
+         quantized = self.quantizer.decode(codes)
+         if self.semantic_frame_rate == "25hz":
+             quantized = F.interpolate(quantized, scale_factor=2, mode="nearest")  ##BCT
+-        x, m_p, logs_p, y_mask = self.enc_p(quantized, y_lengths, text, text_lengths, ge, speed)
++        x, m_p, logs_p, y_mask, _, _ = self.enc_p(quantized, y_lengths, text, text_lengths, ge, speed)
+         fea = self.bridge(x)
+-        fea = F.interpolate(fea, scale_factor=(1.875 if self.version=="v3"else 2), mode="nearest")  ##BCT
++        fea = F.interpolate(fea, scale_factor=(1.875 if self.version == "v3" else 2), mode="nearest")  ##BCT
+         ####more wn paramter to learn mel
+         fea, y_mask_ = self.wns1(fea, y_lengths1, ge)
+         return fea, ge
+@@ -1322,7 +1491,7 @@
+                 ssl = self.ssl_proj(ssl)
+                 quantized, codes, commit_loss, quantized_list = self.quantizer(ssl, layers=[0])
+                 quantized = F.interpolate(quantized, scale_factor=2, mode="nearest")  ##BCT
+-                x, m_p, logs_p, y_mask = self.enc_p(quantized, y_lengths, text, text_lengths, ge)
++                x, m_p, logs_p, y_mask, y_, y_mask_ = self.enc_p(quantized, y_lengths, text, text_lengths, ge)
+         z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=ge)
+         z_p = self.flow(z, y_mask, g=ge)
+         z_slice, ids_slice = commons.rand_slice_segments(z, y_lengths, self.segment_size)
+@@ -1365,7 +1534,7 @@
+         quantized = self.quantizer.decode(codes)
+         if self.semantic_frame_rate == "25hz":
+             quantized = F.interpolate(quantized, scale_factor=2, mode="nearest")  ##BCT
+-        x, m_p, logs_p, y_mask = self.enc_p(quantized, y_lengths, text, text_lengths, ge)
++        x, m_p, logs_p, y_mask, y_, y_mask_ = self.enc_p(quantized, y_lengths, text, text_lengths, ge)
+         fea = self.bridge(x)
+         fea = F.interpolate(fea, scale_factor=1.875, mode="nearest")  ##BCT
+         ####more wn paramter to learn mel
+diff --git a/GPT_SoVITS/module/modules.py b/GPT_SoVITS/module/modules.py
+index 7493f0b..6fa84a4 100644
+--- a/GPT_SoVITS/module/modules.py
++++ b/GPT_SoVITS/module/modules.py
+@@ -1,4 +1,5 @@
+ import math
++
+ import numpy as np
+ import torch
+ from torch import nn
+@@ -718,8 +719,10 @@
+         else:
+             len_ = (~mask).sum(dim=1).unsqueeze(1)
+             x = x.masked_fill(mask.unsqueeze(-1), 0)
+-            x = x.sum(dim=1)
+-            out = torch.div(x, len_)
++            dtype = x.dtype
++            x = x.float()
++            x = torch.div(x, len_.unsqueeze(1))
++            out = x.sum(dim=1).to(dtype)
+         return out
+ 
+     def forward(self, x, mask=None):
+@@ -743,7 +746,6 @@
+         x = self.fc(x)
+         # temoral average pooling
+         w = self.temporal_avg_pool(x, mask=mask)
+-
+         return w.unsqueeze(-1)
+ 
+ 
+diff --git a/GPT_SoVITS/process_ckpt.py b/GPT_SoVITS/process_ckpt.py
+index 4a2a1ba..8f362af 100644
+--- a/GPT_SoVITS/process_ckpt.py
++++ b/GPT_SoVITS/process_ckpt.py
+@@ -17,29 +17,30 @@
+     shutil.move(tmp_path, "%s/%s" % (dir, name))
+ 
+ 
+-"""
+-00:v1
+-01:v2
+-02:v3
+-03:v3lora
+-04:v4lora
+-
+-"""
+ from io import BytesIO
+ 
++model_version2byte = {
++    "v3": b"03",
++    "v4": b"04",
++    "v2Pro": b"05",
++    "v2ProPlus": b"06",
++    "v5dev": b"07",
++    "v5turbo": b"08",
++}
+ 
+-def my_save2(fea, path,cfm_version):
++
++def my_save2(fea, path, model_version):
+     bio = BytesIO()
+     torch.save(fea, bio)
+     bio.seek(0)
+     data = bio.getvalue()
+-    byte=b"03" if cfm_version=="v3"else b"04"
++    byte = model_version2byte[model_version]
+     data = byte + data[2:]
+     with open(path, "wb") as f:
+         f.write(data)
+ 
+ 
+-def savee(ckpt, name, epoch, steps, hps, cfm_version=None,lora_rank=None):
++def savee(ckpt, name, epoch, steps, hps, model_version=None, lora_rank=None):
+     try:
+         opt = OrderedDict()
+         opt["weight"] = {}
+@@ -51,7 +52,9 @@
+         opt["info"] = "%sepoch_%siteration" % (epoch, steps)
+         if lora_rank:
+             opt["lora_rank"] = lora_rank
+-            my_save2(opt, "%s/%s.pth" % (hps.save_weight_dir, name),cfm_version)
++            my_save2(opt, "%s/%s.pth" % (hps.save_weight_dir, name), model_version)
++        elif model_version != None and "Pro" in model_version:
++            my_save2(opt, "%s/%s.pth" % (hps.save_weight_dir, name), model_version)
+         else:
+             my_save(opt, "%s/%s.pth" % (hps.save_weight_dir, name))
+         return "Success."
+@@ -59,18 +62,38 @@
+         return traceback.format_exc()
+ 
+ 
++"""
++finetune version
++00:v1
++01:v2
++02:v3
++03:v3lora
++04:v4lora
++05:v2Pro
++06:v2ProPlus
++07:v5dev-lora
++08:v5turbo-lora
++"""
+ head2version = {
+     b"00": ["v1", "v1", False],
+     b"01": ["v2", "v2", False],
+     b"02": ["v2", "v3", False],
+     b"03": ["v2", "v3", True],
+     b"04": ["v2", "v4", True],
++    b"05": ["v2", "v2Pro", False],
++    b"06": ["v2", "v2ProPlus", False],
++    b"07": ["v2", "v5dev", True],
++    b"08": ["v2", "v5turbo", True],
+ }
+ hash_pretrained_dict = {
+     "dc3c97e17592963677a4a1681f30c653": ["v2", "v2", False],  # s2G488k.pth#sovits_v1_pretrained
+     "43797be674a37c1c83ee81081941ed0f": ["v2", "v3", False],  # s2Gv3.pth#sovits_v3_pretrained
+     "6642b37f3dbb1f76882b69937c95a5f3": ["v2", "v2", False],  # s2G2333K.pth#sovits_v2_pretrained
+     "4f26b9476d0c5033e04162c486074374": ["v2", "v4", False],  # s2Gv4.pth#sovits_v4_pretrained
++    "c7e9fce2223f3db685cdfa1e6368728a": ["v2", "v2Pro", False],  # s2Gv2Pro.pth#sovits_v2Pro_pretrained
++    "66b313e39455b57ab1b0bc0b239c9d0a": ["v2", "v2ProPlus", False],  # s2Gv2ProPlus.pth#sovits_v2ProPlus_pretrained
++    "c4ce1f839a0d271e41963f9fb16ade76": ["v2", "v5dev", False],  # s2Gv5dev.pth
++    "6bc5cb2a195cc8ec22b2e723cd4d6f47": ["v2", "v5turbo", False],  # s2Gv5turbo.pth
+ }
+ import hashlib
+ 
+@@ -115,7 +138,7 @@
+ def load_sovits_new(sovits_path):
+     f = open(sovits_path, "rb")
+     meta = f.read(2)
+-    if meta != "PK":
++    if meta != b"PK":
+         data = b"PK" + f.read()
+         bio = BytesIO()
+         bio.write(data)

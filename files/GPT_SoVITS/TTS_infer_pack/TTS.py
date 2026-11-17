@@ -26,6 +26,7 @@ from BigVGAN.bigvgan import BigVGAN
 from feature_extractor.cnhubert import CNHubert
 from module.mel_processing import mel_spectrogram_torch, spectrogram_torch
 from module.models import SynthesizerTrn, SynthesizerTrnV3, Generator
+from module.models_v5 import synthesize_v5_mel, V5_VERSIONS
 from peft import LoraConfig, get_peft_model
 from process_ckpt import get_sovits_version_from_path_fast, load_sovits_new
 from transformers import AutoModelForMaskedLM, AutoTokenizer
@@ -253,8 +254,13 @@ class TTS_Config:
             "cnhuhbert_base_path": "GPT_SoVITS/pretrained_models/chinese-hubert-base",
             "bert_base_path": "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large",
         },
-
     }
+    for v5_variant in V5_VERSIONS:
+        default_configs[v5_variant] = dict(
+            default_configs["v4"],
+            version=v5_variant,
+            vits_weights_path=f"GPT_SoVITS/pretrained_models/gsv-v5-pretrained/s2G{v5_variant}.pth",
+        )
     configs: dict = None
     v1_languages: list = ["auto", "en", "zh", "ja", "all_zh", "all_ja"]
     v2_languages: list = ["auto", "auto_yue", "en", "zh", "ja", "yue", "ko", "all_zh", "all_ja", "all_yue", "all_ko"]
@@ -289,7 +295,7 @@ class TTS_Config:
 
         assert isinstance(configs, dict)
         version = configs.get("version", "v2").lower()
-        assert version in ["v1", "v2", "v3", "v4"]
+        assert version in ["v1", "v2", "v3", "v4", "v5dev", "v5turbo"]
         self.default_configs[version] = configs.get(version, self.default_configs[version])
         self.configs: dict = configs.get("custom", deepcopy(self.default_configs[version]))
 
@@ -480,7 +486,15 @@ class TTS:
             hps["model"]["version"] = "v1"
         else:
             hps["model"]["version"] = "v2"
-        # version = hps["model"]["version"]
+        version = hps["model"]["version"]
+        v3v4set = {"v3", "v4"} | V5_VERSIONS
+        if model_version not in v3v4set:
+            if "Pro" not in model_version:
+                model_version = version
+            else:
+                hps["model"]["version"] = model_version
+        else:
+            hps["model"]["version"] = model_version
 
         self.configs.filter_length = hps["data"]["filter_length"]
         self.configs.segment_size = hps["train"]["segment_size"]
@@ -496,7 +510,7 @@ class TTS:
 
         # print(f"model_version:{model_version}")
         # print(f'hps["model"]["version"]:{hps["model"]["version"]}')
-        if model_version not in {"v3", "v4"}:
+        if model_version not in v3v4set:
             vits_model = SynthesizerTrn(
                 self.configs.filter_length // 2 + 1,
                 self.configs.segment_size // self.configs.hop_length,
@@ -584,7 +598,7 @@ class TTS:
             self.vocoder_configs["upsample_rate"] = 256
             self.vocoder_configs["overlapped_len"] = 12
 
-        elif version == "v4":
+        elif version in ({"v4"} | V5_VERSIONS):
             if self.vocoder is not None and self.vocoder.__class__.__name__ == "Generator":
                 return
             if self.vocoder is not None:
@@ -603,7 +617,11 @@ class TTS:
                         gin_channels=0, is_bias=True
                     )
             self.vocoder.remove_weight_norm()
-            state_dict_g = torch.load("%s/GPT_SoVITS/pretrained_models/gsv-v4-pretrained/vocoder.pth" % (now_dir,), map_location="cpu")
+            vocoder_dir = "gsv-v5-pretrained" if version in V5_VERSIONS else "gsv-v4-pretrained"
+            state_dict_g = torch.load(
+                "%s/GPT_SoVITS/pretrained_models/%s/vocoder.pth" % (now_dir, vocoder_dir),
+                map_location="cpu", weights_only=False,
+            )
             print("loading vocoder",self.vocoder.load_state_dict(state_dict_g))
 
             self.vocoder_configs["sr"] = 48000
@@ -963,7 +981,7 @@ class TTS:
                     "seed": -1,                   # int. random seed for reproducibility.
                     "parallel_infer": True,       # bool. whether to use parallel inference.
                     "repetition_penalty": 1.35    # float. repetition penalty for T2S model.
-                    "sample_steps": 32,           # int. number of sampling steps for VITS model V3.
+                    "sample_steps": 32,           # int. VITS sampling steps (4 for v5turbo).
                     "super_sampling": False,       # bool. whether to use super-sampling for audio when using VITS model V3.
                 }
         returns:
@@ -992,7 +1010,8 @@ class TTS:
         actual_seed = set_seed(seed)
         parallel_infer = inputs.get("parallel_infer", True)
         repetition_penalty = inputs.get("repetition_penalty", 1.35)
-        sample_steps = inputs.get("sample_steps", 32)
+        sample_steps = inputs.get("sample_steps")
+        sample_steps = (4 if self.configs.version == "v5turbo" else 32) if sample_steps is None else int(sample_steps)
         super_sampling = inputs.get("super_sampling", False)
 
         if parallel_infer:
@@ -1032,7 +1051,7 @@ class TTS:
             assert prompt_lang in self.configs.languages
 
         if no_prompt_text and self.configs.use_vocoder:
-            raise NO_PROMPT_ERROR("prompt_text cannot be empty when using SoVITS_V3")
+            raise NO_PROMPT_ERROR("prompt_text cannot be empty when using SoVITS V3/V4/V5")
 
         if ref_audio_path in [None, ""] and (
             (self.prompt_cache["prompt_semantic"] is None) or (self.prompt_cache["refer_spec"] in [None, []])
@@ -1365,8 +1384,11 @@ class TTS:
         return sr, audio
 
     def using_vocoder_synthesis(
-        self, semantic_tokens: torch.Tensor, phones: torch.Tensor, speed: float = 1.0, sample_steps: int = 32
+        self, semantic_tokens: torch.Tensor, phones: torch.Tensor, speed: float = 1.0,
+        sample_steps: int = None, cfg_rate: float = None,
     ):
+        sample_steps = (4 if self.configs.version == "v5turbo" else 32) if sample_steps is None else int(sample_steps)
+        cfg_rate = 0.0 if cfg_rate is None else float(cfg_rate)
         prompt_semantic_tokens = self.prompt_cache["prompt_semantic"].unsqueeze(0).unsqueeze(0).to(self.configs.device)
         prompt_phones = torch.LongTensor(self.prompt_cache["phones"]).unsqueeze(0).to(self.configs.device)
         refer_audio_spec = self.prompt_cache["refer_spec"][0].to(dtype=self.precision, device=self.configs.device)
@@ -1385,6 +1407,13 @@ class TTS:
 
         mel2 = mel_fn(ref_audio) if self.configs.version == "v3" else mel_fn_v4(ref_audio)
         mel2 = norm_spec(mel2)
+        if self.configs.version in V5_VERSIONS:
+            fea_todo, _ = self.vits_model.decode_encp(semantic_tokens, phones, refer_audio_spec, ge, speed)
+            mel = synthesize_v5_mel(
+                self.vits_model, fea_ref, fea_todo, mel2.to(self.precision), sample_steps, cfg_rate
+            )
+            with torch.inference_mode():
+                return self.vocoder(denorm_spec(mel).to(self.precision))[0, 0]
         T_min = min(mel2.shape[2], fea_ref.shape[2])
         mel2 = mel2[:, :, :T_min]
         fea_ref = fea_ref[:, :, :T_min]
@@ -1432,8 +1461,20 @@ class TTS:
         semantic_tokens_list: List[torch.Tensor],
         batch_phones: List[torch.Tensor],
         speed: float = 1.0,
-        sample_steps: int = 32,
+        sample_steps: int = None,
+        cfg_rate: float = None,
     ) -> List[torch.Tensor]:
+        sample_steps = (4 if self.configs.version == "v5turbo" else 32) if sample_steps is None else int(sample_steps)
+        cfg_rate = 0.0 if cfg_rate is None else float(cfg_rate)
+        if self.configs.version in V5_VERSIONS:
+            return [
+                self.using_vocoder_synthesis(
+                    semantic_tokens_list[i][-idx:].unsqueeze(0).unsqueeze(0),
+                    batch_phones[i].unsqueeze(0).to(self.configs.device),
+                    speed=speed, sample_steps=sample_steps, cfg_rate=cfg_rate,
+                )
+                for i, idx in enumerate(idx_list)
+            ]
         prompt_semantic_tokens = self.prompt_cache["prompt_semantic"].unsqueeze(0).unsqueeze(0).to(self.configs.device)
         prompt_phones = torch.LongTensor(self.prompt_cache["phones"]).unsqueeze(0).to(self.configs.device)
         refer_audio_spec = self.prompt_cache["refer_spec"][0].to(dtype=self.precision, device=self.configs.device)

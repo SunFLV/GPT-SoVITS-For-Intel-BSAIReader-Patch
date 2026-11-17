@@ -50,7 +50,7 @@ gpt_path = os.environ.get("gpt_path", None)
 sovits_path = os.environ.get("sovits_path", None)
 cnhubert_base_path = os.environ.get("cnhubert_base_path", None)
 bert_path = os.environ.get("bert_path", None)
-version = model_version = os.environ.get("version", "v4")
+version = model_version = os.environ.get("version", "v5turbo")
 
 import gradio as gr
 from TTS_infer_pack.text_segmentation_method import get_method
@@ -196,8 +196,10 @@ def change_choices():
 
 path_sovits_v3 = "GPT_SoVITS/pretrained_models/s2Gv3.pth"
 path_sovits_v4 = "GPT_SoVITS/pretrained_models/gsv-v4-pretrained/s2Gv4.pth"
+path_sovits_v5turbo = "GPT_SoVITS/pretrained_models/gsv-v5-pretrained/s2Gv5turbo.pth"
 is_exist_s2gv3 = os.path.exists(path_sovits_v3)
 is_exist_s2gv4 = os.path.exists(path_sovits_v4)
+is_exist_s2gv5turbo = os.path.exists(path_sovits_v5turbo)
 pretrained_sovits_name = [
     "GPT_SoVITS/pretrained_models/s2G488k.pth",
     "GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s2G2333k.pth",
@@ -262,13 +264,13 @@ SoVITS_names, GPT_names = get_weights_names(GPT_weight_root, SoVITS_weight_root)
 
 from process_ckpt import get_sovits_version_from_path_fast
 
-v3v4set={"v3","v4"}
+v3v4set={"v3","v4","v5turbo"}
 def change_sovits_weights(sovits_path, prompt_language=None, text_language=None):
     global version, model_version, dict_language, if_lora_v3
     version, model_version, if_lora_v3 = get_sovits_version_from_path_fast(sovits_path)
     # print(sovits_path,version, model_version, if_lora_v3)
-    is_exist=is_exist_s2gv3 if model_version=="v3"else is_exist_s2gv4
-    path_sovits = path_sovits_v3 if model_version == "v3" else path_sovits_v4
+    is_exist=(is_exist_s2gv3 if model_version=="v3" else is_exist_s2gv5turbo if model_version=="v5turbo" else is_exist_s2gv4)
+    path_sovits = (path_sovits_v3 if model_version == "v3" else path_sovits_v5turbo if model_version == "v5turbo" else path_sovits_v4)
     if if_lora_v3 == True and is_exist == False:
         info = path_sovits + i18n("SoVITS %s 底模缺失，无法加载相应 LoRA 权重"%model_version)
         gr.Warning(info)

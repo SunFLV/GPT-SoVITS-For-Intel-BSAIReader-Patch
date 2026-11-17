@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Apply the backend-agnostic, v4-default BSAIReader patch to a pristine extraction.
+# Apply the backend-agnostic, v5Turbo-ready BSAIReader patch to a pristine extraction.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
