@@ -352,13 +352,16 @@ class TTS_Config:
 
     def save_configs(self, configs_path: str = None) -> None:
         configs = deepcopy(self.default_configs)
+        # Keep the selected version at the top level; TTS_Config reads it from
+        # there, and dropping it silently falls back to v2 on the next load.
+        configs["version"] = self.version
         if self.configs is not None:
             configs["custom"] = self.update_configs()
 
         if configs_path is None:
             configs_path = self.configs_path
-        with open(configs_path, "w") as f:
-            yaml.dump(configs, f)
+        with open(configs_path, "w", encoding="utf-8") as f:
+            yaml.dump(configs, f, allow_unicode=True, sort_keys=False)
 
     def update_configs(self):
         self.config = {

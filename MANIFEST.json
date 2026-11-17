@@ -113,14 +113,14 @@
       "path": "GPT_SoVITS/TTS_infer_pack/TTS.py",
       "category": "source-change",
       "original_bytes": 67630,
-      "modified_bytes": 70266,
+      "modified_bytes": 70519,
       "original_sha256": "ef63f91078ba9cafe427ba92d10bd52f2f8a8b1877befa2790b728fc93d3e8d0",
-      "modified_sha256_exact": "b17d3975aed3dea34ca1368a5b5f39e8281d67755990877036bddf9de573ab72",
-      "modified_sha256_in_patch": "b17d3975aed3dea34ca1368a5b5f39e8281d67755990877036bddf9de573ab72",
+      "modified_sha256_exact": "1e37a6bcbff45825e24bf3a3f749750de68424e8c536b82d29c86161b5fdfa66",
+      "modified_sha256_in_patch": "1e37a6bcbff45825e24bf3a3f749750de68424e8c536b82d29c86161b5fdfa66",
       "line_endings_normalized": false,
       "target_line_ending": "LF",
       "git_blob_old": "d20daee3691fe615e2ad4c7b2a531020986419e7",
-      "git_blob_new": "fda786b29514d0bf48c87288ca2d52795b44a45b"
+      "git_blob_new": "81f13495563a12086bf845e96296b219961a4b1e"
     },
     {
       "path": "GPT_SoVITS/TTS_infer_pack/TextPreprocessor.py",
@@ -139,14 +139,14 @@
       "path": "GPT_SoVITS/configs/tts_infer.yaml",
       "category": "source-change",
       "original_bytes": 1821,
-      "modified_bytes": 2178,
+      "modified_bytes": 2517,
       "original_sha256": "f18e7ea2ea6e9a7a25c3138e5051839797dcb4c4aedde5ed49af852c7aa85176",
-      "modified_sha256_exact": "9e677afee1f56983322879ee81d68656e50a6e997aed7c8356196a0b356518b3",
-      "modified_sha256_in_patch": "08b047e8e516445cea1efc928b06f696ac0eafde5d74157e4ec212037a421bd8",
+      "modified_sha256_exact": "7afe6db3eaa303d1ead15282a4fb641bf3f06452bb4a7b52463b08bc5e14ff84",
+      "modified_sha256_in_patch": "d58908b067ee8dee89123ca32363f697e97550ab63dfe5548392d212913cdc3f",
       "line_endings_normalized": true,
       "target_line_ending": "LF",
       "git_blob_old": "20c41a20ae26a746d37e079a39e29d7af6b4513c",
-      "git_blob_new": "c08ffe78cccc496eefc1308c5040cbee664db763"
+      "git_blob_new": "d503bf60ddfb019a79a7dfb008126c9a29d94b8f"
     },
     {
       "path": "GPT_SoVITS/f5_tts/model/__init__.py",

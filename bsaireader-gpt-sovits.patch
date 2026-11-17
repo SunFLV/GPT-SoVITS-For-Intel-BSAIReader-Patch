@@ -935,7 +935,7 @@ index 8579a63..230a50d 100644
 +# Keep package import lightweight so device_utils can be imported without
 +# pulling in torch/IPEX-dependent modules. Submodules are imported on demand.
 diff --git a/GPT_SoVITS/TTS_infer_pack/TTS.py b/GPT_SoVITS/TTS_infer_pack/TTS.py
-index d20daee..fda786b 100644
+index d20daee..81f1349 100644
 --- a/GPT_SoVITS/TTS_infer_pack/TTS.py
 +++ b/GPT_SoVITS/TTS_infer_pack/TTS.py
 @@ -26,6 +26,7 @@
@@ -986,7 +986,26 @@ index d20daee..fda786b 100644
  
          self.is_half = self.configs.get("is_half", False)
          # if str(self.device) == "cpu" and self.is_half:
-@@ -482,7 +486,15 @@
+@@ -348,13 +352,16 @@
+ 
+     def save_configs(self, configs_path: str = None) -> None:
+         configs = deepcopy(self.default_configs)
++        # Keep the selected version at the top level; TTS_Config reads it from
++        # there, and dropping it silently falls back to v2 on the next load.
++        configs["version"] = self.version
+         if self.configs is not None:
+             configs["custom"] = self.update_configs()
+ 
+         if configs_path is None:
+             configs_path = self.configs_path
+-        with open(configs_path, "w") as f:
+-            yaml.dump(configs, f)
++        with open(configs_path, "w", encoding="utf-8") as f:
++            yaml.dump(configs, f, allow_unicode=True, sort_keys=False)
+ 
+     def update_configs(self):
+         self.config = {
+@@ -482,7 +489,15 @@
              hps["model"]["version"] = "v1"
          else:
              hps["model"]["version"] = "v2"
@@ -1003,7 +1022,7 @@ index d20daee..fda786b 100644
  
          self.configs.filter_length = hps["data"]["filter_length"]
          self.configs.segment_size = hps["train"]["segment_size"]
-@@ -498,7 +510,7 @@
+@@ -498,7 +513,7 @@
  
          # print(f"model_version:{model_version}")
          # print(f'hps["model"]["version"]:{hps["model"]["version"]}')
@@ -1012,7 +1031,7 @@ index d20daee..fda786b 100644
              vits_model = SynthesizerTrn(
                  self.configs.filter_length // 2 + 1,
                  self.configs.segment_size // self.configs.hop_length,
-@@ -586,7 +598,7 @@
+@@ -586,7 +601,7 @@
              self.vocoder_configs["upsample_rate"] = 256
              self.vocoder_configs["overlapped_len"] = 12
  
@@ -1021,7 +1040,7 @@ index d20daee..fda786b 100644
              if self.vocoder is not None and self.vocoder.__class__.__name__ == "Generator":
                  return
              if self.vocoder is not None:
-@@ -605,7 +617,11 @@
+@@ -605,7 +620,11 @@
                          gin_channels=0, is_bias=True
                      )
              self.vocoder.remove_weight_norm()
@@ -1034,7 +1053,7 @@ index d20daee..fda786b 100644
              print("loading vocoder",self.vocoder.load_state_dict(state_dict_g))
  
              self.vocoder_configs["sr"] = 48000
-@@ -671,12 +687,13 @@
+@@ -671,12 +690,13 @@
              if self.vocoder is not None:
                  self.vocoder = self.vocoder.float()
  
@@ -1050,7 +1069,7 @@ index d20daee..fda786b 100644
          self.configs.device = device
          if save:
              self.configs.save_configs()
-@@ -700,9 +717,18 @@
+@@ -700,9 +720,18 @@
          Args:
              ref_audio_path: str, the path of the reference audio.
          """
@@ -1069,7 +1088,7 @@ index d20daee..fda786b 100644
  
      def _set_ref_audio_path(self, ref_audio_path):
          self.prompt_cache["ref_audio_path"] = ref_audio_path
-@@ -955,7 +981,7 @@
+@@ -955,7 +984,7 @@
                      "seed": -1,                   # int. random seed for reproducibility.
                      "parallel_infer": True,       # bool. whether to use parallel inference.
                      "repetition_penalty": 1.35    # float. repetition penalty for T2S model.
@@ -1078,7 +1097,7 @@ index d20daee..fda786b 100644
                      "super_sampling": False,       # bool. whether to use super-sampling for audio when using VITS model V3.
                  }
          returns:
-@@ -984,7 +1010,8 @@
+@@ -984,7 +1013,8 @@
          actual_seed = set_seed(seed)
          parallel_infer = inputs.get("parallel_infer", True)
          repetition_penalty = inputs.get("repetition_penalty", 1.35)
@@ -1088,7 +1107,7 @@ index d20daee..fda786b 100644
          super_sampling = inputs.get("super_sampling", False)
  
          if parallel_infer:
-@@ -1024,7 +1051,7 @@
+@@ -1024,7 +1054,7 @@
              assert prompt_lang in self.configs.languages
  
          if no_prompt_text and self.configs.use_vocoder:
@@ -1097,7 +1116,7 @@ index d20daee..fda786b 100644
  
          if ref_audio_path in [None, ""] and (
              (self.prompt_cache["prompt_semantic"] is None) or (self.prompt_cache["refer_spec"] in [None, []])
-@@ -1298,10 +1325,7 @@
+@@ -1298,10 +1328,7 @@
      def empty_cache(self):
          try:
              gc.collect()  # 触发gc的垃圾回收。避免内存一直增长。
@@ -1109,7 +1128,7 @@ index d20daee..fda786b 100644
          except:
              pass
  
-@@ -1360,8 +1384,11 @@
+@@ -1360,8 +1387,11 @@
          return sr, audio
  
      def using_vocoder_synthesis(
@@ -1122,7 +1141,7 @@ index d20daee..fda786b 100644
          prompt_semantic_tokens = self.prompt_cache["prompt_semantic"].unsqueeze(0).unsqueeze(0).to(self.configs.device)
          prompt_phones = torch.LongTensor(self.prompt_cache["phones"]).unsqueeze(0).to(self.configs.device)
          refer_audio_spec = self.prompt_cache["refer_spec"][0].to(dtype=self.precision, device=self.configs.device)
-@@ -1380,6 +1407,13 @@
+@@ -1380,6 +1410,13 @@
  
          mel2 = mel_fn(ref_audio) if self.configs.version == "v3" else mel_fn_v4(ref_audio)
          mel2 = norm_spec(mel2)
@@ -1136,7 +1155,7 @@ index d20daee..fda786b 100644
          T_min = min(mel2.shape[2], fea_ref.shape[2])
          mel2 = mel2[:, :, :T_min]
          fea_ref = fea_ref[:, :, :T_min]
-@@ -1427,8 +1461,20 @@
+@@ -1427,8 +1464,20 @@
          semantic_tokens_list: List[torch.Tensor],
          batch_phones: List[torch.Tensor],
          speed: float = 1.0,
@@ -1181,38 +1200,89 @@ index 426929f..9b9f39a 100644
          print(text)
  
 diff --git a/GPT_SoVITS/configs/tts_infer.yaml b/GPT_SoVITS/configs/tts_infer.yaml
-index 20c41a2..c08ffe7 100644
+index 20c41a2..d503bf6 100644
 --- a/GPT_SoVITS/configs/tts_infer.yaml
 +++ b/GPT_SoVITS/configs/tts_infer.yaml
-@@ -1,11 +1,12 @@
-+version: v5turbo
- custom:
-   bert_base_path: GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large
-   cnhuhbert_base_path: GPT_SoVITS/pretrained_models/chinese-hubert-base
+@@ -1,40 +1,57 @@
+-custom:
+-  bert_base_path: GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large
+-  cnhuhbert_base_path: GPT_SoVITS/pretrained_models/chinese-hubert-base
 -  device: cuda
-+  device: auto
-   is_half: true
+-  is_half: true
 -  t2s_weights_path: GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s1bert25hz-5kh-longer-epoch=12-step=369668.ckpt
 -  version: v2
 -  vits_weights_path: GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s2G2333k.pth
-+  t2s_weights_path: GPT_SoVITS/pretrained_models/s1v3.ckpt
-+  version: v5turbo
-+  vits_weights_path: GPT_SoVITS/pretrained_models/gsv-v5-pretrained/s2Gv5turbo.pth
  v1:
-   bert_base_path: GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large
-   cnhuhbert_base_path: GPT_SoVITS/pretrained_models/chinese-hubert-base
-@@ -38,3 +39,11 @@
-   t2s_weights_path: GPT_SoVITS/pretrained_models/s1v3.ckpt
-   version: v4
-   vits_weights_path: GPT_SoVITS/pretrained_models/gsv-v4-pretrained/s2Gv4.pth
-+v5turbo:
-+  bert_base_path: GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large
+-  bert_base_path: GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large
+-  cnhuhbert_base_path: GPT_SoVITS/pretrained_models/chinese-hubert-base
+   device: cpu
+   is_half: false
++  version: v1
+   t2s_weights_path: GPT_SoVITS/pretrained_models/s1bert25hz-2kh-longer-epoch=68e-step=50232.ckpt
+-  version: v1
+   vits_weights_path: GPT_SoVITS/pretrained_models/s2G488k.pth
 +  cnhuhbert_base_path: GPT_SoVITS/pretrained_models/chinese-hubert-base
++  bert_base_path: GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large
+ v2:
+-  bert_base_path: GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large
+-  cnhuhbert_base_path: GPT_SoVITS/pretrained_models/chinese-hubert-base
+   device: cpu
+   is_half: false
++  version: v2
+   t2s_weights_path: GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s1bert25hz-5kh-longer-epoch=12-step=369668.ckpt
+-  version: v2
+   vits_weights_path: GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s2G2333k.pth
++  cnhuhbert_base_path: GPT_SoVITS/pretrained_models/chinese-hubert-base
++  bert_base_path: GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large
+ v3:
 +  device: cpu
 +  is_half: false
++  version: v3
 +  t2s_weights_path: GPT_SoVITS/pretrained_models/s1v3.ckpt
++  vits_weights_path: GPT_SoVITS/pretrained_models/s2Gv3.pth
++  cnhuhbert_base_path: GPT_SoVITS/pretrained_models/chinese-hubert-base
++  bert_base_path: GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large
++v4:
++  device: cpu
++  is_half: false
++  version: v4
++  t2s_weights_path: GPT_SoVITS/pretrained_models/s1v3.ckpt
++  vits_weights_path: GPT_SoVITS/pretrained_models/gsv-v4-pretrained/s2Gv4.pth
++  cnhuhbert_base_path: GPT_SoVITS/pretrained_models/chinese-hubert-base
++  bert_base_path: GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large
++v5turbo:
+   bert_base_path: GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large
+   cnhuhbert_base_path: GPT_SoVITS/pretrained_models/chinese-hubert-base
+   device: cpu
+   is_half: false
+   t2s_weights_path: GPT_SoVITS/pretrained_models/s1v3.ckpt
+-  version: v3
+-  vits_weights_path: GPT_SoVITS/pretrained_models/s2Gv3.pth
+-v4:
 +  version: v5turbo
 +  vits_weights_path: GPT_SoVITS/pretrained_models/gsv-v5-pretrained/s2Gv5turbo.pth
++v5dev:
++  device: cpu
++  is_half: false
++  version: v5dev
++  t2s_weights_path: GPT_SoVITS/pretrained_models/s1v3.ckpt
++  vits_weights_path: GPT_SoVITS/pretrained_models/gsv-v5-pretrained/s2Gv5dev.pth
++  cnhuhbert_base_path: GPT_SoVITS/pretrained_models/chinese-hubert-base
++  bert_base_path: GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large
++version: v5turbo
++custom:
++  device: xpu
++  is_half: true
++  version: v5turbo
++  t2s_weights_path: GPT_weights_v4/sunflv.ckpt
++  vits_weights_path: GPT_SoVITS/pretrained_models/gsv-v5-pretrained/s2Gv5turbo.pth
+   bert_base_path: GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large
+   cnhuhbert_base_path: GPT_SoVITS/pretrained_models/chinese-hubert-base
+-  device: cpu
+-  is_half: false
+-  t2s_weights_path: GPT_SoVITS/pretrained_models/s1v3.ckpt
+-  version: v4
+-  vits_weights_path: GPT_SoVITS/pretrained_models/gsv-v4-pretrained/s2Gv4.pth
 diff --git a/GPT_SoVITS/f5_tts/model/__init__.py b/GPT_SoVITS/f5_tts/model/__init__.py
 index 50cff99..4584614 100644
 --- a/GPT_SoVITS/f5_tts/model/__init__.py
