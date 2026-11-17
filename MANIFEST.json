@@ -1,0 +1,201 @@
+{
+  "schema_version": 2,
+  "source_archive": "GPT-SoVITS-For-Intel.zip",
+  "source_folder": "GPT-SoVITS-For-Intel",
+  "goal": "Backend-agnostic patch: CPU, CUDA/ROCm, Intel XPU, Apple MPS, DirectML",
+  "model_version": "v4 hardcoded as the default everywhere; v2 removed from defaults and UI choices",
+  "files": [
+    {
+      "path": "GPT_SoVITS/TTS_infer_pack/device_utils.py",
+      "category": "new-file",
+      "original_bytes": 0,
+      "modified_bytes": 2654,
+      "original_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "modified_sha256_exact": "702b2baaea1435bda7aa2dab981f517266320d2c6d5bb1fb0a94f335a640250b",
+      "modified_sha256_in_patch": "702b2baaea1435bda7aa2dab981f517266320d2c6d5bb1fb0a94f335a640250b",
+      "line_endings_normalized": false,
+      "target_line_ending": "LF",
+      "git_blob_old": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "git_blob_new": "efb7f97d17188de032efd84e0250319cf1b15154"
+    },
+    {
+      "path": "config.py",
+      "category": "source-change",
+      "original_bytes": 2031,
+      "modified_bytes": 2507,
+      "original_sha256": "834b75e9868a13849c2b35aa897e4d2a4647e50997302244cf7bedc913bf1a6d",
+      "modified_sha256_exact": "5f28ec042f4aa719f545daf6e7e09113cd9fab0f26e16b7738dcf806d0f7cc4c",
+      "modified_sha256_in_patch": "5f28ec042f4aa719f545daf6e7e09113cd9fab0f26e16b7738dcf806d0f7cc4c",
+      "line_endings_normalized": false,
+      "target_line_ending": "CRLF",
+      "git_blob_old": "5f90c5cd60994b3f9e064681cd67f80d738a06f6",
+      "git_blob_new": "a1cdd16146097f751dc379958e0ac7cf4cd882f3"
+    },
+    {
+      "path": "api.py",
+      "category": "source-change",
+      "original_bytes": 41548,
+      "modified_bytes": 41560,
+      "original_sha256": "36dd15a3f0b861e7895b47106ceef0d1ff9b74f758aa69075e9064157b366e2a",
+      "modified_sha256_exact": "169330f2f2f89a6db5e799112c64a8426dd3f9b5520a882a5dfd2ab0030b8be3",
+      "modified_sha256_in_patch": "169330f2f2f89a6db5e799112c64a8426dd3f9b5520a882a5dfd2ab0030b8be3",
+      "line_endings_normalized": false,
+      "target_line_ending": "CRLF",
+      "git_blob_old": "4b79d501fc98bb0841d23cd3f854e97bf4358e2d",
+      "git_blob_new": "5b3c09a09b69cce612970454acec1585e167421c"
+    },
+    {
+      "path": "webui.py",
+      "category": "source-change",
+      "original_bytes": 80913,
+      "modified_bytes": 81517,
+      "original_sha256": "44e3e8d5e595e7bf63db1db301fb9a60aba79b9c148c917b0c96747bb50cab5f",
+      "modified_sha256_exact": "b386ce7fed409e8c987fc931c60e20073980ebf2e4a92fb80ac10ef063f84242",
+      "modified_sha256_in_patch": "b386ce7fed409e8c987fc931c60e20073980ebf2e4a92fb80ac10ef063f84242",
+      "line_endings_normalized": false,
+      "target_line_ending": "CRLF",
+      "git_blob_old": "0732d8cd20ecf5dd49ceb2521c0e6057539f789b",
+      "git_blob_new": "13bb2813bb747a5de7412d3bcdf7bf451dd468e2"
+    },
+    {
+      "path": "GPT_SoVITS/AR/models/t2s_lightning_module.py",
+      "category": "source-change",
+      "original_bytes": 4968,
+      "modified_bytes": 5041,
+      "original_sha256": "896b2d0e0ddc7e941f8d76c30a5e0b49453136ddf336807afda9cf079619543d",
+      "modified_sha256_exact": "e1e77ef74e3acc1aa83a896ae9db1c7e47f3aece44f8972dc725113ad5ea97fe",
+      "modified_sha256_in_patch": "e1e77ef74e3acc1aa83a896ae9db1c7e47f3aece44f8972dc725113ad5ea97fe",
+      "line_endings_normalized": false,
+      "target_line_ending": "LF",
+      "git_blob_old": "eb946ca64e95e92e51085808b4a09021bd2df2d2",
+      "git_blob_new": "b7e995eddc222c94ac8d9ea884003ab69777f1cc"
+    },
+    {
+      "path": "GPT_SoVITS/TTS_infer_pack/__init__.py",
+      "category": "source-change",
+      "original_bytes": 44,
+      "modified_bytes": 152,
+      "original_sha256": "1721246a053cc246bc9983827772e33bd8fdd617af2c75acc859c46ec0891f4c",
+      "modified_sha256_exact": "c3176ad3c4e144cccdfb34cd22326471429bb5e50014fe12fcc519e0a644d9c9",
+      "modified_sha256_in_patch": "c3176ad3c4e144cccdfb34cd22326471429bb5e50014fe12fcc519e0a644d9c9",
+      "line_endings_normalized": false,
+      "target_line_ending": "LF",
+      "git_blob_old": "8579a63215aba6c2dc5674c4e8711256c7e904a7",
+      "git_blob_new": "230a50d301fd670bcf407202d5155bc5aba9950d"
+    },
+    {
+      "path": "GPT_SoVITS/TTS_infer_pack/TTS.py",
+      "category": "source-change",
+      "original_bytes": 67630,
+      "modified_bytes": 68045,
+      "original_sha256": "ef63f91078ba9cafe427ba92d10bd52f2f8a8b1877befa2790b728fc93d3e8d0",
+      "modified_sha256_exact": "c3a5cc35120ca0a2889065db8cabdda3f22ae3764f1db2941ab0d6a81c5d342e",
+      "modified_sha256_in_patch": "c3a5cc35120ca0a2889065db8cabdda3f22ae3764f1db2941ab0d6a81c5d342e",
+      "line_endings_normalized": false,
+      "target_line_ending": "LF",
+      "git_blob_old": "d20daee3691fe615e2ad4c7b2a531020986419e7",
+      "git_blob_new": "b8d913048d1ee87d1470dfac73ee6ae2e986dff7"
+    },
+    {
+      "path": "GPT_SoVITS/TTS_infer_pack/TextPreprocessor.py",
+      "category": "source-change",
+      "original_bytes": 9621,
+      "modified_bytes": 10151,
+      "original_sha256": "6a0f3bb29c2996675884ee1959eeec10f482f2ccc559f433c78057db6b48fd64",
+      "modified_sha256_exact": "6e0eb592c9762f76ced98d5c473d54a7bae1af941177f94e4df8714757ae807b",
+      "modified_sha256_in_patch": "6e0eb592c9762f76ced98d5c473d54a7bae1af941177f94e4df8714757ae807b",
+      "line_endings_normalized": false,
+      "target_line_ending": "LF",
+      "git_blob_old": "426929f8bdfbde172d584c51810751e3d3635fac",
+      "git_blob_new": "9b9f39a6f382a1079592b98d19a12169c8339bbe"
+    },
+    {
+      "path": "GPT_SoVITS/configs/tts_infer.yaml",
+      "category": "source-change",
+      "original_bytes": 1821,
+      "modified_bytes": 1805,
+      "original_sha256": "f18e7ea2ea6e9a7a25c3138e5051839797dcb4c4aedde5ed49af852c7aa85176",
+      "modified_sha256_exact": "27a3442dbc97e82b55404d1a58c655870116b8aa696d8b68bb7140c7f92c3e97",
+      "modified_sha256_in_patch": "58f2c149ff49920e25ee14f0c794ce7cd4e4cc46a7d926741ebd3260244365e3",
+      "line_endings_normalized": true,
+      "target_line_ending": "LF",
+      "git_blob_old": "20c41a20ae26a746d37e079a39e29d7af6b4513c",
+      "git_blob_new": "de71029795534d0ab16cab6095672da52dd9310f"
+    },
+    {
+      "path": "GPT_SoVITS/inference_webui.py",
+      "category": "source-change",
+      "original_bytes": 48897,
+      "modified_bytes": 49023,
+      "original_sha256": "478f5f857545eab61bba4d258fabcb2b0b389103cffa94503adf26ac23f1b35e",
+      "modified_sha256_exact": "e95bc2c4983ee4babf872f77f40f2511941e06950875776b4d2ce4316f47fc3c",
+      "modified_sha256_in_patch": "e95bc2c4983ee4babf872f77f40f2511941e06950875776b4d2ce4316f47fc3c",
+      "line_endings_normalized": false,
+      "target_line_ending": "LF",
+      "git_blob_old": "047bc24b877ba9a847b9f7674bee6aecc85337db",
+      "git_blob_new": "cc2e31a086f7d55a28a4026403387cee0c8ef345"
+    },
+    {
+      "path": "GPT_SoVITS/inference_webui_fast.py",
+      "category": "source-change",
+      "original_bytes": 21987,
+      "modified_bytes": 22126,
+      "original_sha256": "53366ca7651426f61d4ce3449537ddae090b18102de7988122a98c3ca4c1f07c",
+      "modified_sha256_exact": "d61fb2253fa351a55f47b28bc573fd8c73a075b6e1df482ab478e8e0ba0c8e19",
+      "modified_sha256_in_patch": "d61fb2253fa351a55f47b28bc573fd8c73a075b6e1df482ab478e8e0ba0c8e19",
+      "line_endings_normalized": false,
+      "target_line_ending": "LF",
+      "git_blob_old": "13dbe1f056e13124827511b3c1989c101f65752e",
+      "git_blob_new": "58e7314a28f9e93bcbd9ee9e9d8768cefbc7bb93"
+    },
+    {
+      "path": "weight.json",
+      "category": "optional-runtime-state",
+      "original_bytes": 60,
+      "modified_bytes": 25,
+      "original_sha256": "e1f3a4b4fa997ed03cdb09c92b7636f95564de2bef2ec59c543e950da3cb71b3",
+      "modified_sha256_exact": "485c506ee800df31926bc973e603c952304229c8a56aaf65f42bedfc8275668e",
+      "modified_sha256_in_patch": "485c506ee800df31926bc973e603c952304229c8a56aaf65f42bedfc8275668e",
+      "line_endings_normalized": false,
+      "target_line_ending": "LF",
+      "git_blob_old": "4db1b492654be7c2840d5a2324600e217e065919",
+      "git_blob_new": "0f75eb100ddfa0f8024364b3eff542444a041854"
+    }
+  ],
+  "baseline_comparison": {
+    "zip_file_count": 63088,
+    "disk_file_count": 63454,
+    "added_on_disk": 374,
+    "missing_on_disk": 8,
+    "size_changed": 6763,
+    "date_changed_same_size": 10,
+    "note": "Initial archive-vs-folder comparison; the portability pass later extended the patch set."
+  },
+  "excluded_runtime_changes": {
+    "recompiled_pyc": 6758,
+    "runtime_files_added": 335,
+    "runtime_files_removed": 8,
+    "uvicorn": "0.20.0 -> 0.39.0 (old dist-info and supervisors/watchgodreload.py removed)",
+    "emoji": "2.15.0 newly installed",
+    "model_weights_added": 14,
+    "other_user_data": [
+      "GPT_SoVITS/text/ja_userdic/user.dict",
+      "GPT_SoVITS/text/ja_userdic/userdict.md5",
+      "tts_output_1786475448.wav"
+    ]
+  },
+  "device_support": {
+    "selection": "auto -> cuda/rocm -> xpu -> mps -> directml -> cpu",
+    "explicit_devices": [
+      "auto",
+      "cuda",
+      "xpu",
+      "mps",
+      "dml",
+      "cpu"
+    ],
+    "fallback": "unavailable explicit device prints a warning and falls back to auto",
+    "cache_release": "backend-specific empty_cache calls are guarded by availability checks",
+    "ipex": "missing or broken IPEX installs no longer abort import"
+  }
+}

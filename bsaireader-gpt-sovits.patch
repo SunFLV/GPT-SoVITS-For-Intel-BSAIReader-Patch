@@ -1,0 +1,534 @@
+diff --git a/GPT_SoVITS/TTS_infer_pack/device_utils.py b/GPT_SoVITS/TTS_infer_pack/device_utils.py
+new file mode 100644
+index 0000000..efb7f97
+--- /dev/null
++++ b/GPT_SoVITS/TTS_infer_pack/device_utils.py
+@@ -0,0 +1,78 @@
++"""Backend-neutral device helpers shared by the TTS pack and WebUI launchers.
++
++The upstream Intel fork assumes ``torch.xpu`` exists. These helpers keep the
++same behavior on Intel XPU while allowing CUDA/ROCm, Apple MPS, DirectML and
++plain CPU to work as well.
++"""
++
++import torch
++
++
++def _backend_available(name: str) -> bool:
++    name = str(name).strip().lower()
++    try:
++        if name.startswith("cuda"):
++            return torch.cuda.is_available()
++        if name.startswith("xpu"):
++            return hasattr(torch, "xpu") and torch.xpu.is_available()
++        if name.startswith("mps"):
++            return hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
++        if name.startswith("dml") or name.startswith("directml"):
++            try:
++                import torch_directml  # noqa: F401
++
++                return True
++            except Exception:
++                return False
++        if name.startswith("cpu"):
++            return True
++    except Exception:
++        return False
++    return False
++
++
++def _make_device(name: str):
++    name = str(name).strip().lower()
++    if name.startswith("dml") or name.startswith("directml"):
++        import torch_directml
++
++        return torch_directml.device()
++    return torch.device(name)
++
++
++def resolve_device(device=None):
++    """Resolve a configured device to an available torch device.
++
++    ``auto`` (or an unavailable explicit device) falls back in this order:
++    CUDA/ROCm -> Intel XPU -> Apple MPS -> DirectML -> CPU.
++    """
++    requested = str(device).strip() if device not in (None, "") else "auto"
++    lowered = requested.lower()
++
++    if lowered not in ("auto", "none"):
++        if _backend_available(lowered):
++            return _make_device(lowered)
++        print("Warning: device '%s' is not available, falling back to auto selection." % device)
++
++    for candidate in ("cuda", "xpu", "mps", "dml", "cpu"):
++        if _backend_available(candidate):
++            return _make_device(candidate)
++    return torch.device("cpu")
++
++
++def empty_device_cache(device=None):
++    """Release cached memory on whichever backend the given device uses."""
++    name = str(device).strip().lower() if device is not None else "auto"
++    try:
++        if name.startswith("cuda") and torch.cuda.is_available():
++            torch.cuda.empty_cache()
++        elif name.startswith("xpu") and hasattr(torch, "xpu") and torch.xpu.is_available():
++            torch.xpu.empty_cache()
++        elif (
++            name.startswith("mps")
++            and hasattr(torch.backends, "mps")
++            and torch.backends.mps.is_available()
++        ):
++            torch.mps.empty_cache()
++    except Exception:
++        pass
+diff --git a/config.py b/config.py
+index 5f90c5c..a1cdd16 100644
+--- a/config.py
++++ b/config.py
+@@ -18,10 +18,23 @@
+ 
+ exp_root = "logs"
+ python_exec = sys.executable or "python"
+-if torch.cuda.is_available():
+-    infer_device = "cuda"
+-else:
+-    infer_device = "cpu"
++def _detect_infer_device():
++    """Pick the first available accelerator: CUDA/ROCm -> XPU -> MPS -> CPU."""
++    checks = (
++        ("cuda", lambda: torch.cuda.is_available()),
++        ("xpu", lambda: hasattr(torch, "xpu") and torch.xpu.is_available()),
++        ("mps", lambda: hasattr(torch.backends, "mps") and torch.backends.mps.is_available()),
++    )
++    for name, check in checks:
++        try:
++            if check():
++                return name
++        except Exception:
++            pass
++    return "cpu"
++
++
++infer_device = _detect_infer_device()
+ 
+ webui_port_main = 9874
+ webui_port_uvr5 = 9873
+diff --git a/api.py b/api.py
+index 4b79d50..5b3c09a 100644
+--- a/api.py
++++ b/api.py
+@@ -1036,7 +1036,7 @@
+ parser.add_argument("-dr", "--default_refer_path", type=str, default="", help="默认参考音频路径")
+ parser.add_argument("-dt", "--default_refer_text", type=str, default="", help="默认参考音频文本")
+ parser.add_argument("-dl", "--default_refer_language", type=str, default="", help="默认参考音频语种")
+-parser.add_argument("-d", "--device", type=str, default=g_config.infer_device, help="cuda / cpu")
++parser.add_argument("-d", "--device", type=str, default=g_config.infer_device, help="cuda / xpu / mps / cpu")
+ parser.add_argument("-a", "--bind_addr", type=str, default="0.0.0.0", help="default: 0.0.0.0")
+ parser.add_argument("-p", "--port", type=int, default=g_config.api_port, help="default: 9880")
+ parser.add_argument(
+diff --git a/webui.py b/webui.py
+index 0732d8c..13bb281 100644
+--- a/webui.py
++++ b/webui.py
+@@ -1,9 +1,9 @@
+ import os
+ import sys
+ 
++version = "v4"
+ if len(sys.argv) == 1:
+-    sys.argv.append("v2")
+-version = "v1" if sys.argv[1] == "v1" else "v2"
++    sys.argv.append(version)
+ os.environ["version"] = version
+ now_dir = os.getcwd()
+ sys.path.insert(0, now_dir)
+@@ -18,7 +18,10 @@
+ 
+ import psutil
+ import torch
+-import intel_extension_for_pytorch as ipex
++try:
++    import intel_extension_for_pytorch as ipex
++except Exception:
++    ipex = None
+ import yaml
+ 
+ os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
+@@ -98,53 +101,55 @@
+ 
+ n_cpu = cpu_count()
+ 
+-ngpu = torch.xpu.device_count()
++ngpu = 0
+ gpu_infos = []
+ mem = []
+ if_gpu_ok = False
+-
+-# 判断是否有能用来训练和加速推理的N卡
+-ok_gpu_keywords = {
+-    "10",
+-    "16",
+-    "20",
+-    "30",
+-    "40",
+-    "A2",
+-    "A3",
+-    "A4",
+-    "P4",
+-    "A50",
+-    "500",
+-    "A60",
+-    "70",
+-    "80",
+-    "90",
+-    "M4",
+-    "T4",
+-    "TITAN",
+-    "L4",
+-    "4060",
+-    "H",
+-    "600",
+-    "506",
+-    "507",
+-    "508",
+-    "509",
+-}
+ set_gpu_numbers = set()
+-if torch.xpu.is_available() or ngpu != 0:
+-    for i in range(ngpu):
+-        gpu_name = torch.xpu.get_device_name(i)
+-        if_gpu_ok = True  # 直接标记为有可用显卡
+-        gpu_infos.append("%s\t%s" % (i, gpu_name))
+-        set_gpu_numbers.add(i)
+-        mem.append(int(torch.xpu.get_device_properties(i).total_memory / 1024 / 1024 / 1024 + 0.4))
+-# # 判断是否支持mps加速
+-# if torch.backends.mps.is_available():
+-#     if_gpu_ok = True
+-#     gpu_infos.append("%s\t%s" % ("0", "Apple GPU"))
+-#     mem.append(psutil.virtual_memory().total/ 1024 / 1024 / 1024) # 实测使用系统内存作为显存不会爆显存
++
++
++def _collect_accelerators():
++    """Detect CUDA/ROCm, Intel XPU and Apple MPS without assuming any is present."""
++    global ngpu, if_gpu_ok
++
++    # NVIDIA and AMD ROCm are both exposed through torch.cuda.
++    try:
++        if torch.cuda.is_available():
++            for i in range(torch.cuda.device_count()):
++                gpu_infos.append("%s\t%s" % (i, torch.cuda.get_device_name(i)))
++                props = torch.cuda.get_device_properties(i)
++                mem.append(int(props.total_memory / 1024 / 1024 / 1024 + 0.4))
++                set_gpu_numbers.add(i)
++                if_gpu_ok = True
++    except Exception:
++        pass
++
++    # Intel XPU is optional; torch.xpu does not exist in CPU/CUDA-only builds.
++    try:
++        if hasattr(torch, "xpu") and torch.xpu.is_available():
++            for i in range(torch.xpu.device_count()):
++                gpu_infos.append("%s\t%s" % (i, torch.xpu.get_device_name(i)))
++                props = torch.xpu.get_device_properties(i)
++                mem.append(int(props.total_memory / 1024 / 1024 / 1024 + 0.4))
++                set_gpu_numbers.add(i)
++                if_gpu_ok = True
++    except Exception:
++        pass
++
++    # Apple Metal uses unified memory.
++    try:
++        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
++            gpu_infos.append("%s\t%s" % ("0", "Apple GPU"))
++            mem.append(int(psutil.virtual_memory().total / 1024 / 1024 / 1024))
++            set_gpu_numbers.add(0)
++            if_gpu_ok = True
++    except Exception:
++        pass
++
++    ngpu = len(gpu_infos)
++
++
++_collect_accelerators()
+ 
+ 
+ v3v4set={"v3","v4"}
+@@ -1492,7 +1497,7 @@
+                 with gr.Row():
+                     exp_name = gr.Textbox(label=i18n("*实验/模型名"), value="xxx", interactive=True)
+                     gpu_info = gr.Textbox(label=i18n("显卡信息"), value=gpu_info, visible=True, interactive=False)
+-                    version_checkbox = gr.Radio(label=i18n("版本"), value=version, choices=["v1", "v2", "v4"])#, "v3"
++                    version_checkbox = gr.Radio(label=i18n("版本"), value=version, choices=["v4"], interactive=False)
+                 with gr.Row():
+                     pretrained_s2G = gr.Textbox(
+                         label=i18n("预训练SoVITS-G模型路径"),
+diff --git a/GPT_SoVITS/AR/models/t2s_lightning_module.py b/GPT_SoVITS/AR/models/t2s_lightning_module.py
+index eb946ca..b7e995e 100644
+--- a/GPT_SoVITS/AR/models/t2s_lightning_module.py
++++ b/GPT_SoVITS/AR/models/t2s_lightning_module.py
+@@ -15,7 +15,8 @@
+ 
+ try:
+     import intel_extension_for_pytorch as ipex
+-except ImportError:
++except Exception:
++    # IPEX may be missing, or installed but unable to load its native DLL.
+     ipex = None
+ 
+ 
+diff --git a/GPT_SoVITS/TTS_infer_pack/__init__.py b/GPT_SoVITS/TTS_infer_pack/__init__.py
+index 8579a63..230a50d 100644
+--- a/GPT_SoVITS/TTS_infer_pack/__init__.py
++++ b/GPT_SoVITS/TTS_infer_pack/__init__.py
+@@ -1 +1,2 @@
+-from . import TTS, text_segmentation_method
++# Keep package import lightweight so device_utils can be imported without
++# pulling in torch/IPEX-dependent modules. Submodules are imported on demand.
+diff --git a/GPT_SoVITS/TTS_infer_pack/TTS.py b/GPT_SoVITS/TTS_infer_pack/TTS.py
+index d20daee..b8d9130 100644
+--- a/GPT_SoVITS/TTS_infer_pack/TTS.py
++++ b/GPT_SoVITS/TTS_infer_pack/TTS.py
+@@ -35,6 +35,7 @@
+ from tools.my_utils import load_audio
+ from TTS_infer_pack.text_segmentation_method import splits
+ from TTS_infer_pack.TextPreprocessor import TextPreprocessor
++from TTS_infer_pack.device_utils import empty_device_cache, resolve_device
+ 
+ language = os.environ.get("language", "Auto")
+ language = sys.argv[-1] if sys.argv[-1] in scan_language_list() else language
+@@ -292,10 +293,7 @@
+         self.default_configs[version] = configs.get(version, self.default_configs[version])
+         self.configs: dict = configs.get("custom", deepcopy(self.default_configs[version]))
+ 
+-        self.device = self.configs.get("device", torch.device("cpu"))
+-        if "cuda" in str(self.device) and not torch.cuda.is_available():
+-            print("Warning: CUDA is not available, set device to CPU.")
+-            self.device = torch.device("cpu")
++        self.device = resolve_device(self.configs.get("device", "cpu"))
+ 
+         self.is_half = self.configs.get("is_half", False)
+         # if str(self.device) == "cpu" and self.is_half:
+@@ -671,12 +669,13 @@
+             if self.vocoder is not None:
+                 self.vocoder = self.vocoder.float()
+ 
+-    def set_device(self, device: torch.device, save: bool = True):
++    def set_device(self, device: Union[str, torch.device], save: bool = True):
+         """
+         To set the device for all models.
+         Args:
+-            device: torch.device, the device to use for all models.
++            device: torch.device or string ("auto", "cuda", "xpu", "mps", "dml", "cpu").
+         """
++        device = resolve_device(device)
+         self.configs.device = device
+         if save:
+             self.configs.save_configs()
+@@ -700,9 +699,18 @@
+         Args:
+             ref_audio_path: str, the path of the reference audio.
+         """
++        # Drop every voice-specific cache entry before loading a new reference
++        # audio. Stale tensors here make a later request reuse the previous
++        # speaker and keep device memory pinned across voice switches.
++        for key in ("prompt_semantic", "refer_spec", "raw_audio", "raw_sr",
++                    "bert_features", "phones", "norm_text", "prompt_text",
++                    "prompt_lang", "aux_ref_audio_paths"):
++            self.prompt_cache[key] = [] if key in ("refer_spec", "aux_ref_audio_paths") else None
++        self.empty_cache()
+         self._set_prompt_semantic(ref_audio_path)
+         self._set_ref_spec(ref_audio_path)
+         self._set_ref_audio_path(ref_audio_path)
++        self.empty_cache()
+ 
+     def _set_ref_audio_path(self, ref_audio_path):
+         self.prompt_cache["ref_audio_path"] = ref_audio_path
+@@ -1298,10 +1306,7 @@
+     def empty_cache(self):
+         try:
+             gc.collect()  # 触发gc的垃圾回收。避免内存一直增长。
+-            if "cuda" in str(self.configs.device):
+-                torch.cuda.empty_cache()
+-            elif str(self.configs.device) == "mps":
+-                torch.mps.empty_cache()
++            empty_device_cache(self.configs.device)
+         except:
+             pass
+ 
+diff --git a/GPT_SoVITS/TTS_infer_pack/TextPreprocessor.py b/GPT_SoVITS/TTS_infer_pack/TextPreprocessor.py
+index 426929f..9b9f39a 100644
+--- a/GPT_SoVITS/TTS_infer_pack/TextPreprocessor.py
++++ b/GPT_SoVITS/TTS_infer_pack/TextPreprocessor.py
+@@ -78,8 +78,15 @@
+         text = text.strip("\n")
+         if len(text) == 0:
+             return []
+-        if text[0] not in splits and len(get_first(text)) < 4:
+-            text = "。" + text if lang != "en" else "." + text
++        # [BSAIReader 2026-09-05] Upstream prepends "。" to texts whose first
++        # sentence is <4 chars, as a pause aid. With v4-style weights this prefix
++        # was observed to make T2S decode immediate-EOS -> ~12 noise tokens ->
++        # inaudible audio (first reproduced on Intel XPU, but the prefix lives in
++        # the text layer, so the fix is backend-neutral). Short text synthesizes
++        # fine without it; revert these two lines only if a future model set is
++        # again tested to need the prefix.
++        # if text[0] not in splits and len(get_first(text)) < 4:
++        #     text = "。" + text if lang != "en" else "." + text
+         print(i18n("实际输入的目标文本:"))
+         print(text)
+ 
+diff --git a/GPT_SoVITS/configs/tts_infer.yaml b/GPT_SoVITS/configs/tts_infer.yaml
+index 20c41a2..de71029 100644
+--- a/GPT_SoVITS/configs/tts_infer.yaml
++++ b/GPT_SoVITS/configs/tts_infer.yaml
+@@ -1,11 +1,12 @@
++version: v4
+ custom:
+   bert_base_path: GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large
+   cnhuhbert_base_path: GPT_SoVITS/pretrained_models/chinese-hubert-base
+-  device: cuda
++  device: auto
+   is_half: true
+-  t2s_weights_path: GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s1bert25hz-5kh-longer-epoch=12-step=369668.ckpt
+-  version: v2
+-  vits_weights_path: GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s2G2333k.pth
++  t2s_weights_path: GPT_SoVITS/pretrained_models/s1v3.ckpt
++  version: v4
++  vits_weights_path: GPT_SoVITS/pretrained_models/gsv-v4-pretrained/s2Gv4.pth
+ v1:
+   bert_base_path: GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large
+   cnhuhbert_base_path: GPT_SoVITS/pretrained_models/chinese-hubert-base
+diff --git a/GPT_SoVITS/inference_webui.py b/GPT_SoVITS/inference_webui.py
+index 047bc24..cc2e31a 100644
+--- a/GPT_SoVITS/inference_webui.py
++++ b/GPT_SoVITS/inference_webui.py
+@@ -29,6 +29,7 @@
+ import sys
+ 
+ import torch
++from TTS_infer_pack.device_utils import empty_device_cache, resolve_device
+ os.environ["TORCH_XPU_BACKEND"] = "ipex"
+ from text.LangSegmenter import LangSegmenter
+ 
+@@ -38,7 +39,7 @@
+     analytics.version_check = lambda: None
+ except:
+     ...
+-version = model_version = os.environ.get("version", "v2")
++version = model_version = os.environ.get("version", "v4")
+ path_sovits_v3 = "GPT_SoVITS/pretrained_models/s2Gv3.pth"
+ path_sovits_v4 = "GPT_SoVITS/pretrained_models/gsv-v4-pretrained/s2Gv4.pth"
+ is_exist_s2gv3 = os.path.exists(path_sovits_v3)
+@@ -94,7 +95,7 @@
+ is_share = eval(is_share)
+ if "_XPU_VISIBLE_DEVICES" in os.environ:
+     os.environ["XPU_VISIBLE_DEVICES"] = os.environ["_XPU_VISIBLE_DEVICES"]
+-is_half = eval(os.environ.get("is_half", "True")) and torch.xpu.is_available()
++is_half = eval(os.environ.get("is_half", "True"))
+ # is_half=False
+ punctuation = set(["!", "?", "…", ",", ".", "-", " "])
+ import gradio as gr
+@@ -118,7 +119,11 @@
+     os.environ["PYTHONHASHSEED"] = str(seed)
+     np.random.seed(seed)
+     torch.manual_seed(seed)
+-    torch.xpu.manual_seed(seed)
++    if hasattr(torch, "xpu"):
++        try:
++            torch.xpu.manual_seed(seed)
++        except Exception:
++            pass
+ 
+ 
+ # set_seed(42)
+@@ -138,10 +143,8 @@
+ 
+ # os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'  # 确保直接启动推理UI时也能够设置。
+ 
+-if torch.xpu.is_available():
+-    device = "xpu"
+-else:
+-    device = "cpu"
++device = resolve_device(os.environ.get("device", "auto"))
++is_half = is_half and str(device) != "cpu"
+ 
+ dict_language_v1 = {
+     i18n("中文"): "all_zh",  # 全部按中文识别
+@@ -414,8 +417,7 @@
+     if hifigan_model:
+         hifigan_model=hifigan_model.cpu()
+         hifigan_model=None
+-        try:torch.xpu.empty_cache()
+-        except:pass
++        empty_device_cache(device)
+     if is_half == True:
+         bigvgan_model = bigvgan_model.half().to(device)
+     else:
+@@ -440,8 +442,7 @@
+     if bigvgan_model:
+         bigvgan_model=bigvgan_model.cpu()
+         bigvgan_model=None
+-        try:torch.xpu.empty_cache()
+-        except:pass
++        empty_device_cache(device)
+     if is_half == True:
+         hifigan_model = hifigan_model.half().to(device)
+     else:
+diff --git a/GPT_SoVITS/inference_webui_fast.py b/GPT_SoVITS/inference_webui_fast.py
+index 13dbe1f..58e7314 100644
+--- a/GPT_SoVITS/inference_webui_fast.py
++++ b/GPT_SoVITS/inference_webui_fast.py
+@@ -26,7 +26,10 @@
+ logging.getLogger("charset_normalizer").setLevel(logging.ERROR)
+ logging.getLogger("torchaudio._extension").setLevel(logging.ERROR)
+ import torch
+-import intel_extension_for_pytorch as ipex
++try:
++    import intel_extension_for_pytorch as ipex
++except Exception:
++    ipex = None
+ try:
+     import gradio.analytics as analytics
+ 
+@@ -42,16 +45,17 @@
+ if "_XPU_VISIBLE_DEVICES" in os.environ:
+     os.environ["XPU_VISIBLE_DEVICES"] = os.environ["_XPU_VISIBLE_DEVICES"]
+ 
+-is_half = eval(os.environ.get("is_half", "True")) and torch.xpu.is_available()
++is_half = eval(os.environ.get("is_half", "True"))
+ gpt_path = os.environ.get("gpt_path", None)
+ sovits_path = os.environ.get("sovits_path", None)
+ cnhubert_base_path = os.environ.get("cnhubert_base_path", None)
+ bert_path = os.environ.get("bert_path", None)
+-version = model_version = os.environ.get("version", "v2")
++version = model_version = os.environ.get("version", "v4")
+ 
+ import gradio as gr
+ from TTS_infer_pack.text_segmentation_method import get_method
+ from TTS_infer_pack.TTS import NO_PROMPT_ERROR, TTS, TTS_Config
++from TTS_infer_pack.device_utils import resolve_device
+ 
+ from tools.i18n.i18n import I18nAuto, scan_language_list
+ 
+@@ -62,15 +66,11 @@
+ 
+ # os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'  # 确保直接启动推理UI时也能够设置。
+ 
+-if torch.xpu.is_available():
+-    device = "xpu"
+-# elif torch.backends.mps.is_available():
+-#     device = "mps"
+-else:
+-    device = "cpu"
+-
+-# is_half = False
+-# device = "cpu"
++device = resolve_device(os.environ.get("device", "auto"))
++is_half = is_half and str(device) != "cpu"
++
++# To force a backend, set the "device" environment variable
++# (auto / cuda / xpu / mps / dml / cpu). Unavailable choices fall back to auto.
+ 
+ dict_language_v1 = {
+     i18n("中文"): "all_zh",  # 全部按中文识别

@@ -1,0 +1,9 @@
+diff --git a/weight.json b/weight.json
+index 4db1b49..0f75eb1 100644
+--- a/weight.json
++++ b/weight.json
+@@ -1 +1 @@
+-{"GPT": {"v2": "GPT_weights_v4/zzm-e15.ckpt"}, "SoVITS": {}}
+\ No newline at end of file
++{"GPT": {}, "SoVITS": {}}
+\ No newline at end of file
