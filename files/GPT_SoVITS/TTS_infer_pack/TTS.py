@@ -1109,7 +1109,36 @@ class TTS:
         ###### text preprocessing ########
         t1 = time.perf_counter()
         data: list = None
-        if not return_fragment:
+        # [BSAIReader] 逐句批量：一次请求送进多句，返回时仍是「每句一段音频」。
+        # 语音前端（含 BERT/CNHuBERT）按句各跑一次，模型推理则把这几句凑成
+        # 一个 batch —— 这才是长文合成真正能并行的地方（实测 4 句一批 ≈ 逐句
+        # 串行的 1/3 耗时）。调用方按 texts 的顺序拿回音频，点读时间点依旧精确。
+        texts_in = inputs.get("texts")
+        if texts_in and not return_fragment:
+            data = []
+            for _t in texts_in:
+                phones, bert_features, norm_text = self.text_preprocessor.segment_and_extract_feature_for_text(
+                    _t, text_lang, self.configs.version
+                )
+                if phones is None or norm_text == "":
+                    # 交给调用方：这一批退回逐句合成，别让一句坏文本拖垮整批
+                    raise ValueError(f"text cannot be phonemized: {_t[:24]!r}")
+                data.append({"phones": phones, "bert_features": bert_features, "norm_text": norm_text})
+            if len(data) == 0:
+                yield 16000, np.zeros(int(16000), dtype=np.int16)
+                return
+
+            batch_index_list: list = None
+            data, batch_index_list = self.to_batch(
+                data,
+                prompt_data=self.prompt_cache if not no_prompt_text else None,
+                batch_size=batch_size,
+                threshold=batch_threshold,
+                split_bucket=split_bucket,
+                device=self.configs.device,
+                precision=self.precision,
+            )
+        elif not return_fragment:
             data = self.text_preprocessor.preprocess(text, text_lang, text_split_method, self.configs.version)
             if len(data) == 0:
                 yield 16000, np.zeros(int(16000), dtype=np.int16)
@@ -1307,6 +1336,27 @@ class TTS:
                 print("%.3f\t%.3f\t%.3f\t%.3f" % (t1 - t0, t2 - t1, t_34, t_45))
                 if len(audio) == 0:
                     yield 16000, np.zeros(int(16000), dtype=np.int16)
+                    return
+                # [BSAIReader] return_items：不拼接，按输入顺序把每句单独交回去。
+                # audio 是「每批一个 list」，先按 batch_index_list 还原成原始顺序
+                # （split_bucket 会按长度重排过），再逐句做后处理（限幅 + 句间静音），
+                # 这样调用方拿到的仍是逐句 WAV，点读偏移一分不差。
+                if inputs.get("return_items"):
+                    items = (self.recovery_order(audio, batch_index_list)
+                             if split_bucket else sum(audio, []))
+                    outs = []
+                    for _item in items:
+                        _, _arr = self.audio_postprocess(
+                            [[_item]],
+                            output_sr,
+                            None,
+                            speed_factor,
+                            False,
+                            fragment_interval,
+                            super_sampling if self.configs.use_vocoder and self.configs.version == "v3" else False,
+                        )
+                        outs.append(_arr)
+                    yield output_sr, outs
                     return
                 yield self.audio_postprocess(
                     audio,

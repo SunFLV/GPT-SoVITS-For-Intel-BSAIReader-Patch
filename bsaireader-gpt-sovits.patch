@@ -615,6 +615,66 @@ index 0000000..c8f595b
 +        rolling_mel = generated[..., -reference_frames:].to(reference_mel.dtype)
 +        rolling_features = target[..., -reference_frames:]
 +    return torch.cat(results, dim=-1)
+diff --git a/api_v2.py b/api_v2.py
+index 8708207..a7961dd 100644
+--- a/api_v2.py
++++ b/api_v2.py
+@@ -438,6 +438,55 @@
+     return await tts_handle(req)
+ 
+ 
++@APP.post("/tts_batch")
++async def tts_batch_endpoint(request: dict):
++    """[BSAIReader] 一次请求合成多句，逐句返回。
++
++    请求 = /tts 的全部参数 + `texts: ["第一句", "第二句", ...]`。
++    语音前端仍按句逐个处理（BERT/CNHuBERT），但模型推理会把这几句凑成一个
++    batch 一起跑 —— 长文合成时这是唯一真正有效的并行方式（单进程 API 的推理
++    是串行的，多开进程又会 OOM）。
++
++    返回：{"sample_rate": 32000, "wavs": ["<base64 wav>", ...]}，顺序与 texts 一致。
++    任何一句失败 → 400，调用方退回逐句合成。
++    """
++    import base64
++    texts = request.get("texts") or []
++    if not texts:
++        return JSONResponse(status_code=400, content={"message": "texts is required"})
++
++    req = dict(request)          # 保留 texts：run() 靠它走「逐句批量」分支
++    # check_params 要求 text 非空；真正参与合成的是 texts 分支，text 只是占位
++    req["text"] = "\n".join(texts)
++    req["return_items"] = True
++    req["streaming_mode"] = False
++    req["return_fragment"] = False
++    # 批大小至少等于句数：这一批句子必须落在同一次前向里
++    req["batch_size"] = max(int(req.get("batch_size") or 1), len(texts))
++    req.setdefault("text_lang", "zh")
++    req.setdefault("media_type", "wav")
++    req.setdefault("text_split_method", "cut0")
++
++    check_res = check_params(req)
++    if check_res is not None:
++        return check_res
++
++    try:
++        sr, items = next(tts_pipeline.run(req))
++        wavs = []
++        for item in items:
++            buf = pack_audio(BytesIO(), item, sr, "wav").getvalue()
++            wavs.append(base64.b64encode(buf).decode())
++        if len(wavs) != len(texts):
++            return JSONResponse(status_code=400, content={
++                "message": f"batch produced {len(wavs)} wavs for {len(texts)} texts"})
++        return {"sample_rate": sr, "wavs": wavs}
++    except Exception as e:
++        import traceback
++        traceback.print_exc()
++        return JSONResponse(status_code=400, content={"message": "tts_batch failed", "Exception": str(e)})
++
++
+ @APP.get("/set_refer_audio")
+ async def set_refer_aduio(refer_audio_path: str = None):
+     try:
 diff --git a/config.py b/config.py
 index 5f90c5c..81a1e46 100644
 --- a/config.py
@@ -935,7 +995,7 @@ index 8579a63..230a50d 100644
 +# Keep package import lightweight so device_utils can be imported without
 +# pulling in torch/IPEX-dependent modules. Submodules are imported on demand.
 diff --git a/GPT_SoVITS/TTS_infer_pack/TTS.py b/GPT_SoVITS/TTS_infer_pack/TTS.py
-index d20daee..09e5cad 100644
+index d20daee..485ef2a 100644
 --- a/GPT_SoVITS/TTS_infer_pack/TTS.py
 +++ b/GPT_SoVITS/TTS_infer_pack/TTS.py
 @@ -26,6 +26,7 @@
@@ -1151,7 +1211,73 @@ index d20daee..09e5cad 100644
  
          if ref_audio_path in [None, ""] and (
              (self.prompt_cache["prompt_semantic"] is None) or (self.prompt_cache["refer_spec"] in [None, []])
-@@ -1298,10 +1336,7 @@
+@@ -1071,7 +1109,36 @@
+         ###### text preprocessing ########
+         t1 = time.perf_counter()
+         data: list = None
+-        if not return_fragment:
++        # [BSAIReader] 逐句批量：一次请求送进多句，返回时仍是「每句一段音频」。
++        # 语音前端（含 BERT/CNHuBERT）按句各跑一次，模型推理则把这几句凑成
++        # 一个 batch —— 这才是长文合成真正能并行的地方（实测 4 句一批 ≈ 逐句
++        # 串行的 1/3 耗时）。调用方按 texts 的顺序拿回音频，点读时间点依旧精确。
++        texts_in = inputs.get("texts")
++        if texts_in and not return_fragment:
++            data = []
++            for _t in texts_in:
++                phones, bert_features, norm_text = self.text_preprocessor.segment_and_extract_feature_for_text(
++                    _t, text_lang, self.configs.version
++                )
++                if phones is None or norm_text == "":
++                    # 交给调用方：这一批退回逐句合成，别让一句坏文本拖垮整批
++                    raise ValueError(f"text cannot be phonemized: {_t[:24]!r}")
++                data.append({"phones": phones, "bert_features": bert_features, "norm_text": norm_text})
++            if len(data) == 0:
++                yield 16000, np.zeros(int(16000), dtype=np.int16)
++                return
++
++            batch_index_list: list = None
++            data, batch_index_list = self.to_batch(
++                data,
++                prompt_data=self.prompt_cache if not no_prompt_text else None,
++                batch_size=batch_size,
++                threshold=batch_threshold,
++                split_bucket=split_bucket,
++                device=self.configs.device,
++                precision=self.precision,
++            )
++        elif not return_fragment:
+             data = self.text_preprocessor.preprocess(text, text_lang, text_split_method, self.configs.version)
+             if len(data) == 0:
+                 yield 16000, np.zeros(int(16000), dtype=np.int16)
+@@ -1270,6 +1337,27 @@
+                 if len(audio) == 0:
+                     yield 16000, np.zeros(int(16000), dtype=np.int16)
+                     return
++                # [BSAIReader] return_items：不拼接，按输入顺序把每句单独交回去。
++                # audio 是「每批一个 list」，先按 batch_index_list 还原成原始顺序
++                # （split_bucket 会按长度重排过），再逐句做后处理（限幅 + 句间静音），
++                # 这样调用方拿到的仍是逐句 WAV，点读偏移一分不差。
++                if inputs.get("return_items"):
++                    items = (self.recovery_order(audio, batch_index_list)
++                             if split_bucket else sum(audio, []))
++                    outs = []
++                    for _item in items:
++                        _, _arr = self.audio_postprocess(
++                            [[_item]],
++                            output_sr,
++                            None,
++                            speed_factor,
++                            False,
++                            fragment_interval,
++                            super_sampling if self.configs.use_vocoder and self.configs.version == "v3" else False,
++                        )
++                        outs.append(_arr)
++                    yield output_sr, outs
++                    return
+                 yield self.audio_postprocess(
+                     audio,
+                     output_sr,
+@@ -1298,10 +1386,7 @@
      def empty_cache(self):
          try:
              gc.collect()  # 触发gc的垃圾回收。避免内存一直增长。
@@ -1163,7 +1289,7 @@ index d20daee..09e5cad 100644
          except:
              pass
  
-@@ -1360,8 +1395,11 @@
+@@ -1360,8 +1445,11 @@
          return sr, audio
  
      def using_vocoder_synthesis(
@@ -1176,7 +1302,7 @@ index d20daee..09e5cad 100644
          prompt_semantic_tokens = self.prompt_cache["prompt_semantic"].unsqueeze(0).unsqueeze(0).to(self.configs.device)
          prompt_phones = torch.LongTensor(self.prompt_cache["phones"]).unsqueeze(0).to(self.configs.device)
          refer_audio_spec = self.prompt_cache["refer_spec"][0].to(dtype=self.precision, device=self.configs.device)
-@@ -1380,6 +1418,13 @@
+@@ -1380,6 +1468,13 @@
  
          mel2 = mel_fn(ref_audio) if self.configs.version == "v3" else mel_fn_v4(ref_audio)
          mel2 = norm_spec(mel2)
@@ -1190,7 +1316,7 @@ index d20daee..09e5cad 100644
          T_min = min(mel2.shape[2], fea_ref.shape[2])
          mel2 = mel2[:, :, :T_min]
          fea_ref = fea_ref[:, :, :T_min]
-@@ -1427,8 +1472,20 @@
+@@ -1427,8 +1522,20 @@
          semantic_tokens_list: List[torch.Tensor],
          batch_phones: List[torch.Tensor],
          speed: float = 1.0,

@@ -1,6 +1,17 @@
 # GPT-SoVITS-For-Intel — BSAIReader 通用后端 + v5Turbo 补丁
 
-由未修改的 `GPT-SoVITS-For-Intel.zip` 与已修改目录逐文件比对生成，包含后端通用化、v5Turbo 推理支持，以及此前的短句静音/缓存修复。
+由未修改的 `GPT-SoVITS-For-Intel.zip` 与已修改目录逐文件比对生成，包含后端通用化、v5Turbo 推理支持、逐句批量推理接口，以及此前的短句静音/缓存修复。
+
+## 逐句批量推理（`POST /tts_batch`）
+
+长文合成的瓶颈是逐句串行的自回归解码：`/tts` 的推理在事件循环里同步执行，请求之间严格串行，`batch_size` 只作用于“这一句被切成几段”。新增的 `/tts_batch` 接受 `texts: [...]`，把这几句凑成一次前向，再按句返回音频（`wavs` 与 `texts` 同序）—— 调用方仍拿到逐句 WAV，点读时间点不变。
+
+| 一次提交 | 每句耗时（A770/v5turbo） | 相对逐句 |
+|---|---|---|
+| 1 句 | 12.1 s | 1.0× |
+| 4 句 | 8.2 s | 1.5× |
+| 8 句 | 5.6 s | 2.1× |
+| 12/16 句 | 6.5 s | 1.9× |
 
 ## v5Turbo 支持
 
@@ -24,7 +35,7 @@ GPT_SoVITS/pretrained_models/gsv-v5-pretrained/vocoder.pth
 
 ## 主补丁文件
 
-新增 3 个：`device_utils.py`、`module/cache_dit.py`、`module/models_v5.py`。修改 15 个，共 18 个文件。`files/` 是应用后的完整文件，`MANIFEST.json` 是机器可读清单，`CHANGES.md` 是逐项说明。
+新增 3 个：`device_utils.py`、`module/cache_dit.py`、`module/models_v5.py`。修改 16 个（含 `api_v2.py`），共 19 个文件。`files/` 是应用后的完整文件，`MANIFEST.json` 是机器可读清单，`CHANGES.md` 是逐项说明。
 
 ## 应用
 
