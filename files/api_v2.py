@@ -100,6 +100,8 @@ RESP:
 
 import os
 import sys
+import json
+import base64
 import traceback
 from typing import Generator
 
@@ -461,7 +463,9 @@ async def tts_batch_endpoint(request: dict):
     req["return_items"] = True
     req["streaming_mode"] = False
     req["return_fragment"] = False
-    # 批大小至少等于句数：这一批句子必须落在同一次前向里
+    # 这个端点一次性返回全部（调用方只取第一项），所以不开动态接活；
+    # 需要「算好一句发一句」请用 /tts_batch_stream。
+    req["dynamic_batch"] = False
     req["batch_size"] = max(int(req.get("batch_size") or 1), len(texts))
     req.setdefault("text_lang", "zh")
     req.setdefault("media_type", "wav")
@@ -485,6 +489,52 @@ async def tts_batch_endpoint(request: dict):
         import traceback
         traceback.print_exc()
         return JSONResponse(status_code=400, content={"message": "tts_batch failed", "Exception": str(e)})
+
+
+@APP.post("/tts_batch_stream")
+def tts_batch_stream_endpoint(request: dict):
+    """[BSAIReader] 动态接活 + 逐句流式返回（NDJSON，一句一行）。
+
+    请求 = /tts 的全部参数 + `texts: [...]` + `batch_size`（**并发槽位数**，
+    不是句数）+ `dynamic_batch: true`。后端槽位一空就补下一句，每生成完一句
+    立刻解码并写一行：
+
+        {"index": 0, "wav": "<base64 wav>"}
+        {"index": 3, "wav": "..."}        ← 完成顺序不保证等于句序
+        {"error": "..."}                  ← 出错时
+
+    所以调用方必须按 `index` 归位 —— 这正是「顺序不会错」的保证。
+    """
+    import base64
+    texts = request.get("texts") or []
+    if not texts:
+        return JSONResponse(status_code=400, content={"message": "texts is required"})
+
+    req = dict(request)
+    req["text"] = "\n".join(texts)
+    req["return_items"] = True
+    req["streaming_mode"] = False
+    req["return_fragment"] = False
+    req["dynamic_batch"] = True
+    req["batch_size"] = int(req.get("batch_size") or 1)
+    req.setdefault("text_lang", "zh")
+    req.setdefault("media_type", "wav")
+    req.setdefault("text_split_method", "cut0")
+
+    def gen():
+        try:
+            for sr, items in tts_pipeline.run(req):
+                for bi, arr in items:
+                    buf = pack_audio(BytesIO(), arr, sr, "wav").getvalue()
+                    yield json.dumps(
+                        {"index": int(bi), "wav": base64.b64encode(buf).decode()},
+                        ensure_ascii=False) + "\n"
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            yield json.dumps({"error": str(e)}, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(gen(), media_type="application/x-ndjson")
 
 
 @APP.get("/set_refer_audio")

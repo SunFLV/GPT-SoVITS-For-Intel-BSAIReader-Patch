@@ -616,10 +616,19 @@ index 0000000..c8f595b
 +        rolling_features = target[..., -reference_frames:]
 +    return torch.cat(results, dim=-1)
 diff --git a/api_v2.py b/api_v2.py
-index 8708207..a7961dd 100644
+index 8708207..8fd7666 100644
 --- a/api_v2.py
 +++ b/api_v2.py
-@@ -438,6 +438,55 @@
+@@ -100,6 +100,8 @@
+ 
+ import os
+ import sys
++import json
++import base64
+ import traceback
+ from typing import Generator
+ 
+@@ -438,6 +440,103 @@
      return await tts_handle(req)
  
  
@@ -646,7 +655,9 @@ index 8708207..a7961dd 100644
 +    req["return_items"] = True
 +    req["streaming_mode"] = False
 +    req["return_fragment"] = False
-+    # 批大小至少等于句数：这一批句子必须落在同一次前向里
++    # 这个端点一次性返回全部（调用方只取第一项），所以不开动态接活；
++    # 需要「算好一句发一句」请用 /tts_batch_stream。
++    req["dynamic_batch"] = False
 +    req["batch_size"] = max(int(req.get("batch_size") or 1), len(texts))
 +    req.setdefault("text_lang", "zh")
 +    req.setdefault("media_type", "wav")
@@ -670,6 +681,52 @@ index 8708207..a7961dd 100644
 +        import traceback
 +        traceback.print_exc()
 +        return JSONResponse(status_code=400, content={"message": "tts_batch failed", "Exception": str(e)})
++
++
++@APP.post("/tts_batch_stream")
++def tts_batch_stream_endpoint(request: dict):
++    """[BSAIReader] 动态接活 + 逐句流式返回（NDJSON，一句一行）。
++
++    请求 = /tts 的全部参数 + `texts: [...]` + `batch_size`（**并发槽位数**，
++    不是句数）+ `dynamic_batch: true`。后端槽位一空就补下一句，每生成完一句
++    立刻解码并写一行：
++
++        {"index": 0, "wav": "<base64 wav>"}
++        {"index": 3, "wav": "..."}        ← 完成顺序不保证等于句序
++        {"error": "..."}                  ← 出错时
++
++    所以调用方必须按 `index` 归位 —— 这正是「顺序不会错」的保证。
++    """
++    import base64
++    texts = request.get("texts") or []
++    if not texts:
++        return JSONResponse(status_code=400, content={"message": "texts is required"})
++
++    req = dict(request)
++    req["text"] = "\n".join(texts)
++    req["return_items"] = True
++    req["streaming_mode"] = False
++    req["return_fragment"] = False
++    req["dynamic_batch"] = True
++    req["batch_size"] = int(req.get("batch_size") or 1)
++    req.setdefault("text_lang", "zh")
++    req.setdefault("media_type", "wav")
++    req.setdefault("text_split_method", "cut0")
++
++    def gen():
++        try:
++            for sr, items in tts_pipeline.run(req):
++                for bi, arr in items:
++                    buf = pack_audio(BytesIO(), arr, sr, "wav").getvalue()
++                    yield json.dumps(
++                        {"index": int(bi), "wav": base64.b64encode(buf).decode()},
++                        ensure_ascii=False) + "\n"
++        except Exception as e:
++            import traceback
++            traceback.print_exc()
++            yield json.dumps({"error": str(e)}, ensure_ascii=False) + "\n"
++
++    return StreamingResponse(gen(), media_type="application/x-ndjson")
 +
 +
  @APP.get("/set_refer_audio")
@@ -986,6 +1043,261 @@ index eb946ca..b7e995e 100644
      ipex = None
  
  
+diff --git a/GPT_SoVITS/AR/models/t2s_model.py b/GPT_SoVITS/AR/models/t2s_model.py
+index 4725b7a..d429130 100644
+--- a/GPT_SoVITS/AR/models/t2s_model.py
++++ b/GPT_SoVITS/AR/models/t2s_model.py
+@@ -778,6 +778,250 @@
+         # print(idx_list)
+         return y_list, idx_list
+ 
++    # ────────────────────────────────────────────────────────────────────
++    # [BSAIReader] 动态接活 + 逐句流式返回
++    # ────────────────────────────────────────────────────────────────────
++    def _embed_seq(self, phones, bert, max_len):
++        """单句 → text embedding（与批量路径同一套算子，左 padding 到 max_len）。"""
++        xi = self.ar_text_embedding(phones.unsqueeze(0))
++        xi = xi + self.bert_proj(bert.transpose(0, 1).unsqueeze(0))
++        xi = self.ar_text_position(xi).squeeze(0)   # 与主批一致：[L, D]
++        if xi.shape[0] < max_len:                   # 左 padding 到统一长度
++            xi = F.pad(xi, (0, 0, max_len - xi.shape[0], 0), value=0)
++        return xi
++
++    def _prefill_seq(self, x_new, prompts_one):
++        """单序列 prefill，返回 (src_len, k_cache, v_cache)。"""
++        y_emb = self.ar_audio_embedding(prompts_one)
++        y_pos = self.ar_audio_position(y_emb)
++        x_new = x_new.unsqueeze(0) if x_new.dim() == 2 else x_new
++        xy = torch.concat([x_new, y_pos], dim=1)
++        x_len, prefix_len = x_new.shape[1], prompts_one.shape[1]
++        src_len = xy.shape[1]
++        x_mask = F.pad(
++            torch.zeros(x_len, x_len, dtype=torch.bool, device=xy.device), (0, prefix_len), value=True
++        )
++        y_mask = F.pad(
++            torch.triu(torch.ones(prefix_len, prefix_len, dtype=torch.bool, device=xy.device), diagonal=1),
++            (x_len, 0),
++            value=False,
++        )
++        causal = torch.concat([x_mask, y_mask], dim=0).view(1, src_len, src_len)
++        attn = causal.unsqueeze(1).expand(-1, self.num_head, -1, -1).bool()
++        _, k_cache, v_cache = self.t2s_transformer.process_prompt(xy, attn)
++        return src_len, k_cache, v_cache
++
++    def infer_panel_batch_infer_dynamic_stream(
++        self,
++        x: List[torch.LongTensor],
++        x_lens: torch.LongTensor,
++        prompts: torch.LongTensor,
++        bert_feature: List[torch.LongTensor],
++        top_k: int = -100,
++        top_p: int = 100,
++        early_stop_num: int = -1,
++        temperature: float = 1.0,
++        repetition_penalty: float = 1.35,
++        queue: list = None,
++        **kwargs,
++    ):
++        """批量推理 + **动态接活** + **逐句吐出**（generator）。
++
++        两层优化叠在一起：
++        1. 某条序列生成到 EOS 被摘掉后，立刻从 `queue` 补下一句，槽位不空转；
++        2. 每有一句生成完，就 `yield (原始句号, tokens, 有效长度)` —— 调用方
++           可以立刻解码这一句并发给客户端，不必等整批结束。
++
++        上游在 EOS 时会把该序列从 y / attn_mask / k_cache / v_cache 里
++        index_select 摘掉，所以"空位"天然存在，这里只是往里补新序列；上游每步
++        只保留「当前 query 那一行」的 mask，所以新序列的可见范围可以和别人不同
++        （只允许看自己前面那 src_len 列）；新序列 KV 走一次单序列 prefill 后
++        **右补 0** 到当前 K 长度并整体 mask，位置编码按每序列自己的步数取。
++        """
++        if prompts is None or not queue:
++            y_list, idx_list = self.infer_panel_batch_infer(
++                x, x_lens, prompts, bert_feature, top_k=top_k, top_p=top_p,
++                early_stop_num=early_stop_num, temperature=temperature,
++                repetition_penalty=repetition_penalty, **kwargs,
++            )
++            for i, (yy, ii) in enumerate(zip(y_list, idx_list)):
++                yield i, yy, ii
++            return
++
++        max_len = kwargs.get("max_len", x_lens.max())
++        x_emb = torch.stack([self._embed_seq(xi, bi, max_len)
++                             for xi, bi in zip(x, bert_feature)], dim=0)
++
++        y = prompts
++        x_len = x_emb.shape[1]
++        y_emb = self.ar_audio_embedding(y)
++        y_len = y_emb.shape[1]
++        prefix_len = y.shape[1]
++        y_lens = torch.LongTensor([y_len] * y_emb.shape[0]).to(x_emb.device)
++        y_pos = self.ar_audio_position(y_emb)
++        xy_pos = torch.concat([x_emb, y_pos], dim=1)
++
++        bsz = x_emb.shape[0]
++        src_len = x_len + y_len
++        y_paddind_mask = make_pad_mask_left(y_lens, y_len)
++        x_paddind_mask = make_pad_mask_left(x_lens, max_len)
++        padding_mask = torch.concat([x_paddind_mask, y_paddind_mask], dim=1)
++        x_mask = F.pad(torch.zeros(x_len, x_len, dtype=torch.bool, device=x_emb.device), (0, y_len), value=True)
++        y_mask = F.pad(
++            torch.triu(torch.ones(y_len, y_len, dtype=torch.bool, device=x_emb.device), diagonal=1),
++            (x_len, 0),
++            value=False,
++        )
++        causal_mask = torch.concat([x_mask, y_mask], dim=0).view(1, src_len, src_len).repeat(bsz, 1, 1)
++        padding_mask = padding_mask.view(bsz, 1, src_len).repeat(1, src_len, 1)
++        attn_mask = causal_mask.logical_or(padding_mask)
++        attn_mask = attn_mask.unsqueeze(1).expand(-1, self.num_head, -1, -1).bool()
++
++        batch_idx_map = list(range(y.shape[0]))   # batch 行 -> 原始句号
++        step = torch.zeros(bsz, dtype=torch.long, device=x_emb.device)
++        pending = list(queue)
++        emitted = set()
++        filled = 0
++
++        def _refill(k_cache, v_cache, attn_mask, y, step):
++            nonlocal pending, filled
++            while pending and y.shape[0] < bsz:
++                item = pending.pop(0)
++                x_new = self._embed_seq(item["phones"], item["bert"], max_len)
++                prompts_one = prompts[:1]
++                _, k_new, v_new = self._prefill_seq(x_new, prompts_one)
++                # cache 与 mask 的 key 维差 1 是上游历史行为（第 0 步 pad 出来
++                # 的那一列对应"还没生成"的位置），插入时统一对齐到较大的那个。
++                # 上游每步都是「先 pad mask 一列、再喂下一个 token」，所以 EOS
++                # 这一刻 mask 比 cache 多一列（那一列是给下一步占位的）。插入时
++                # 以 cache 长度为准，把多出来的占位列裁掉，两边就对齐了；下一步
++                # 主循环会再 pad 回来，语义不变。
++                cur_k = k_cache[0].shape[1]
++                if attn_mask.shape[-1] > cur_k:
++                    attn_mask = attn_mask[..., :cur_k]
++                elif attn_mask.shape[-1] < cur_k:
++                    attn_mask = F.pad(attn_mask, (0, cur_k - attn_mask.shape[-1]), value=False)
++                pad = cur_k - src_len
++                if pad < 0:
++                    continue
++                for li in range(len(k_cache)):
++                    k_cache[li] = torch.cat(
++                        [k_cache[li], F.pad(k_new[li], (0, 0, 0, pad), value=0)], dim=0)
++                    v_cache[li] = torch.cat(
++                        [v_cache[li], F.pad(v_new[li], (0, 0, 0, pad), value=0)], dim=0)
++                row = torch.zeros(1, self.num_head, 1, cur_k, dtype=torch.bool, device=attn_mask.device)
++                row[:, :, :, src_len:] = True
++                attn_mask = torch.cat([attn_mask, row], dim=0)
++                y_new = torch.cat(
++                    [torch.zeros(1, y.shape[1] - prompts_one.shape[1], dtype=y.dtype, device=y.device),
++                     prompts_one], dim=1)
++                y = torch.cat([y, y_new], dim=0)
++                step = torch.cat([step, torch.zeros(1, dtype=torch.long, device=step.device)])
++                batch_idx_map.append(item.get("index", len(batch_idx_map)))
++                filled += 1
++            return k_cache, v_cache, attn_mask, y, step
++
++        k_cache = v_cache = None
++        for idx in tqdm(range(1500)):
++            if idx == 0:
++                xy_dec, k_cache, v_cache = self.t2s_transformer.process_prompt(xy_pos, attn_mask, None)
++            else:
++                xy_dec, k_cache, v_cache = self.t2s_transformer.decode_next_token(
++                    xy_pos, k_cache, v_cache, attn_mask)
++            logits = self.ar_predict_layer(xy_dec[:, -1])
++
++            if idx == 0:
++                attn_mask = F.pad(attn_mask[:, :, -1].unsqueeze(-2), (0, 1), value=False)
++                logits = logits[:, :-1]
++            else:
++                attn_mask = F.pad(attn_mask, (0, 1), value=False)
++
++            samples = sample(logits, y, top_k=top_k, top_p=top_p,
++                             repetition_penalty=repetition_penalty, temperature=temperature)[0]
++            y = torch.concat([y, samples], dim=1)
++            step = step + 1
++
++            tokens = torch.argmax(logits, dim=-1)
++            if (self.EOS in samples[:, 0]) or (self.EOS in tokens):
++                l = (samples[:, 0] == self.EOS).logical_or(tokens == self.EOS)
++                removed = torch.where(l)[0].tolist()
++                reserved = torch.where(~l)[0]
++                for i in removed:
++                    bi = batch_idx_map[i]
++                    if bi not in emitted:
++                        emitted.add(bi)
++                        yield bi, y[i, :-1], max(1, int(step[i].item()) - 1)
++                batch_idx_map = [batch_idx_map[i] for i in reserved.tolist()]
++                y = torch.index_select(y, dim=0, index=reserved)
++                attn_mask = torch.index_select(attn_mask, dim=0, index=reserved)
++                step = torch.index_select(step, dim=0, index=reserved)
++                if k_cache is not None:
++                    for li in range(len(k_cache)):
++                        k_cache[li] = torch.index_select(k_cache[li], dim=0, index=reserved)
++                        v_cache[li] = torch.index_select(v_cache[li], dim=0, index=reserved)
++                # 空位立刻接活（剩余预算不足就不接了，免得新句子被截断）
++                if step.numel():
++                    budget = (1 << 30 if early_stop_num == -1
++                              else early_stop_num - int(step.max().item()))
++                    if budget > 64:
++                        k_cache, v_cache, attn_mask, y, step = _refill(
++                            k_cache, v_cache, attn_mask, y, step)
++
++            stop = False
++            if (early_stop_num != -1 and (y.shape[1] - prefix_len) > early_stop_num) or idx == 1499:
++                stop = True
++            elif not pending and y.shape[0] == 0:
++                stop = True
++
++            if stop:
++                print(f"T2S Decoding EOS [{prefix_len} -> {y.shape[1]}] (动态接活 {filled} 句)")
++                # 没跑到 EOS 的句子用当前已生成的部分兜底
++                for i, bi in enumerate(batch_idx_map):
++                    if bi not in emitted:
++                        emitted.add(bi)
++                        yield bi, y[i], max(1, y.shape[1] - prefix_len)
++                break
++
++            y_emb = self.ar_audio_embedding(y[:, -1:])
++            pos_idx = (y_len + step).clamp(max=self.ar_audio_position.pe.shape[1] - 1)
++            pe = self.ar_audio_position.pe[:, pos_idx].transpose(0, 1)
++            xy_pos = y_emb * self.ar_audio_position.x_scale + \
++                self.ar_audio_position.alpha * pe.to(dtype=y_emb.dtype, device=y_emb.device)
++
++    def infer_panel_batch_infer_dynamic(
++        self,
++        x: List[torch.LongTensor],
++        x_lens: torch.LongTensor,
++        prompts: torch.LongTensor,
++        bert_feature: List[torch.LongTensor],
++        top_k: int = -100,
++        top_p: int = 100,
++        early_stop_num: int = -1,
++        temperature: float = 1.0,
++        repetition_penalty: float = 1.35,
++        queue: list = None,
++        **kwargs,
++    ):
++        """非流式包装：跑完再一起返回（保持与批量接口一致的返回形状）。"""
++        total = len(x) + (len(queue) if queue else 0)
++        y_list: list = [None] * total
++        idx_list: list = [None] * total
++        for bi, yy, n in self.infer_panel_batch_infer_dynamic_stream(
++            x, x_lens, prompts, bert_feature, top_k=top_k, top_p=top_p,
++            early_stop_num=early_stop_num, temperature=temperature,
++            repetition_penalty=repetition_penalty, queue=queue, **kwargs,
++        ):
++            if bi >= len(y_list):
++                grow = bi + 1 - len(y_list)
++                y_list.extend([None] * grow)
++                idx_list.extend([None] * grow)
++            y_list[bi] = yy
++            idx_list[bi] = n
++        while y_list and y_list[-1] is None:      # 队列里没轮到的句子
++            y_list.pop()
++            idx_list.pop()
++        return y_list, idx_list
++
+     def infer_panel_naive_batched(
+         self,
+         x: List[torch.LongTensor],  #####全部文本token
 diff --git a/GPT_SoVITS/TTS_infer_pack/__init__.py b/GPT_SoVITS/TTS_infer_pack/__init__.py
 index 8579a63..230a50d 100644
 --- a/GPT_SoVITS/TTS_infer_pack/__init__.py
@@ -995,7 +1307,7 @@ index 8579a63..230a50d 100644
 +# Keep package import lightweight so device_utils can be imported without
 +# pulling in torch/IPEX-dependent modules. Submodules are imported on demand.
 diff --git a/GPT_SoVITS/TTS_infer_pack/TTS.py b/GPT_SoVITS/TTS_infer_pack/TTS.py
-index d20daee..485ef2a 100644
+index d20daee..6804992 100644
 --- a/GPT_SoVITS/TTS_infer_pack/TTS.py
 +++ b/GPT_SoVITS/TTS_infer_pack/TTS.py
 @@ -26,6 +26,7 @@
@@ -1211,7 +1523,7 @@ index d20daee..485ef2a 100644
  
          if ref_audio_path in [None, ""] and (
              (self.prompt_cache["prompt_semantic"] is None) or (self.prompt_cache["refer_spec"] in [None, []])
-@@ -1071,7 +1109,36 @@
+@@ -1071,7 +1109,39 @@
          ###### text preprocessing ########
          t1 = time.perf_counter()
          data: list = None
@@ -1236,20 +1548,119 @@ index d20daee..485ef2a 100644
 +                return
 +
 +            batch_index_list: list = None
-+            data, batch_index_list = self.to_batch(
-+                data,
-+                prompt_data=self.prompt_cache if not no_prompt_text else None,
-+                batch_size=batch_size,
-+                threshold=batch_threshold,
-+                split_bucket=split_bucket,
-+                device=self.configs.device,
-+                precision=self.precision,
-+            )
++            # 动态接活模式：保持「逐句」形态，分批交给 AR 层自己做（见下面的
++            # dynamic_batch 分支）—— 先 to_batch 成固定批就接不了活了。
++            if not inputs.get("dynamic_batch"):
++                data, batch_index_list = self.to_batch(
++                    data,
++                    prompt_data=self.prompt_cache if not no_prompt_text else None,
++                    batch_size=batch_size,
++                    threshold=batch_threshold,
++                    split_bucket=split_bucket,
++                    device=self.configs.device,
++                    precision=self.precision,
++                )
 +        elif not return_fragment:
              data = self.text_preprocessor.preprocess(text, text_lang, text_split_method, self.configs.version)
              if len(data) == 0:
                  yield 16000, np.zeros(int(16000), dtype=np.int16)
-@@ -1270,6 +1337,27 @@
+@@ -1132,6 +1202,95 @@
+             t_45 = 0.0
+             audio = []
+             output_sr = self.configs.sampling_rate if not self.configs.use_vocoder else self.vocoder_configs["sr"]
++            # ── 动态接活 + 逐句流式返回 ────────────────────────────────
++            # 上游批量循环要等一批里所有句子都 EOS 才算完；这里改成：谁空了就
++            # 补下一句，而且**每生成完一句立刻解码 + yield**，调用方收到就能落盘、
++            # 更新进度、给点读用 —— 不必等整批。
++            # yield 的格式是 (sr, [(原始句号, np数组), ...])。
++            if inputs.get("dynamic_batch") and not return_fragment and len(data) > 1:
++                try:
++                    pos = 0
++                    bs = max(1, min(int(batch_size or 1), len(data)))
++                    while pos < len(data):
++                        chunk = data[pos:pos + bs]
++                        batches, _ = self.to_batch(
++                            chunk,
++                            prompt_data=self.prompt_cache if not no_prompt_text else None,
++                            batch_size=len(chunk),
++                            threshold=batch_threshold,
++                            split_bucket=False,
++                            device=self.configs.device,
++                            precision=self.precision,
++                        )
++                        if not batches:
++                            break
++                        init = batches[0]
++                        # 后面的句子逐句预处理成 queue（一次只建一小段）
++                        queue = []
++                        for k, it in enumerate(data[pos + bs:pos + bs + 24]):
++                            qb, _ = self.to_batch(
++                                [it],
++                                prompt_data=self.prompt_cache if not no_prompt_text else None,
++                                batch_size=1,
++                                threshold=batch_threshold,
++                                split_bucket=False,
++                                device=self.configs.device,
++                                precision=self.precision,
++                            )
++                            if not qb:
++                                continue
++                            queue.append({
++                                "phones": qb[0]["all_phones"][0],
++                                "phones_len": qb[0]["all_phones_len"][0],
++                                "bert": qb[0]["all_bert_features"][0],
++                                "phones_only": qb[0]["phones"][0],
++                                "index": pos + bs + k,
++                            })
++                        max_len = max(
++                            [int(t.shape[0]) for t in init["all_phones"]]
++                            + [int(q["phones"].shape[0]) for q in queue] + [1])
++                        prompt = (self.prompt_cache["prompt_semantic"]
++                                  .expand(len(init["all_phones"]), -1).to(self.configs.device)
++                                  if not no_prompt_text else None)
++                        phones_all = [init["phones"][i] for i in range(len(init["phones"]))]
++                        phones_all += [q["phones_only"] for q in queue]
++
++                        n_done = 0
++                        for bi, y_tok, n_tok in self.t2s_model.model.infer_panel_batch_infer_dynamic_stream(
++                            init["all_phones"],
++                            init["all_phones_len"],
++                            prompt,
++                            init["all_bert_features"],
++                            top_k=top_k,
++                            top_p=top_p,
++                            temperature=temperature,
++                            early_stop_num=self.configs.hz * self.configs.max_sec,
++                            max_len=max_len,
++                            repetition_penalty=repetition_penalty,
++                            queue=queue,
++                        ):
++                            n_done = max(n_done, bi + 1)
++                            _pred = y_tok[-n_tok:].unsqueeze(0).unsqueeze(0)
++                            _ph = phones_all[bi].unsqueeze(0).to(self.configs.device)
++                            frag = self.using_vocoder_synthesis(
++                                _pred, _ph, speed=speed_factor, sample_steps=sample_steps)
++                            _, _arr = self.audio_postprocess(
++                                [[frag]], output_sr, None, speed_factor, False, fragment_interval,
++                                super_sampling if self.configs.use_vocoder and self.configs.version == "v3" else False)
++                            yield output_sr, [(pos + bi, _arr)]
++                        if n_done <= 0:
++                            break
++                        pos += n_done
++                        print(f"[dynamic] {pos}/{len(data)} 句")
++                    return
++                except Exception as e:
++                    import traceback
++                    traceback.print_exc()
++                    # data 这时是「逐句」形态，不能继续走静态批分支（会缺字段）。
++                    # 抛给调用方，由服务端退回 /tts_batch 或逐句合成。
++                    print(f"[dynamic] 动态批失败（{e}）")
++                    raise
++
+             for item in data:
+                 t3 = time.perf_counter()
+                 if return_fragment:
+@@ -1270,6 +1429,27 @@
                  if len(audio) == 0:
                      yield 16000, np.zeros(int(16000), dtype=np.int16)
                      return
@@ -1277,7 +1688,7 @@ index d20daee..485ef2a 100644
                  yield self.audio_postprocess(
                      audio,
                      output_sr,
-@@ -1298,10 +1386,7 @@
+@@ -1298,10 +1478,7 @@
      def empty_cache(self):
          try:
              gc.collect()  # 触发gc的垃圾回收。避免内存一直增长。
@@ -1289,7 +1700,7 @@ index d20daee..485ef2a 100644
          except:
              pass
  
-@@ -1360,8 +1445,11 @@
+@@ -1360,8 +1537,11 @@
          return sr, audio
  
      def using_vocoder_synthesis(
@@ -1302,7 +1713,7 @@ index d20daee..485ef2a 100644
          prompt_semantic_tokens = self.prompt_cache["prompt_semantic"].unsqueeze(0).unsqueeze(0).to(self.configs.device)
          prompt_phones = torch.LongTensor(self.prompt_cache["phones"]).unsqueeze(0).to(self.configs.device)
          refer_audio_spec = self.prompt_cache["refer_spec"][0].to(dtype=self.precision, device=self.configs.device)
-@@ -1380,6 +1468,13 @@
+@@ -1380,6 +1560,13 @@
  
          mel2 = mel_fn(ref_audio) if self.configs.version == "v3" else mel_fn_v4(ref_audio)
          mel2 = norm_spec(mel2)
@@ -1316,7 +1727,7 @@ index d20daee..485ef2a 100644
          T_min = min(mel2.shape[2], fea_ref.shape[2])
          mel2 = mel2[:, :, :T_min]
          fea_ref = fea_ref[:, :, :T_min]
-@@ -1427,8 +1522,20 @@
+@@ -1427,8 +1614,20 @@
          semantic_tokens_list: List[torch.Tensor],
          batch_phones: List[torch.Tensor],
          speed: float = 1.0,

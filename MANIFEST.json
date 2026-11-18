@@ -48,14 +48,14 @@
       "path": "api_v2.py",
       "category": "source-change",
       "original_bytes": 18507,
-      "modified_bytes": 20652,
+      "modified_bytes": 22610,
       "original_sha256": "2293a747564359440f03c5062ece6d96c308f3fb4d6d2ed1a9c0fbf87d38aae3",
-      "modified_sha256_exact": "b0fac75edbba75a3447448666e07b4dd8b39ddaf125f9a9b71402670cc2dda6a",
-      "modified_sha256_in_patch": "b0fac75edbba75a3447448666e07b4dd8b39ddaf125f9a9b71402670cc2dda6a",
+      "modified_sha256_exact": "3cd30a2ec92b05f9d90d7f086b9588f153be999190d8f8f7afd4d5d113fc1b17",
+      "modified_sha256_in_patch": "3cd30a2ec92b05f9d90d7f086b9588f153be999190d8f8f7afd4d5d113fc1b17",
       "line_endings_normalized": false,
       "target_line_ending": "LF",
       "git_blob_old": "8708207432d2ec53a99b4e4e53cfbdaa57dd2769",
-      "git_blob_new": "a7961dd5704d0dfe6935b6dc22db8c3387cb027b"
+      "git_blob_new": "8fd7666257dd9958a10ee72f045685f283d335f1"
     },
     {
       "path": "config.py",
@@ -110,6 +110,19 @@
       "git_blob_new": "b7e995eddc222c94ac8d9ea884003ab69777f1cc"
     },
     {
+      "path": "GPT_SoVITS/AR/models/t2s_model.py",
+      "category": "source-change",
+      "original_bytes": 33556,
+      "modified_bytes": 46190,
+      "original_sha256": "ed522b8e9601ba2bda03c8c86250bbcc1cc59a848e1ca24842150af783bdecd4",
+      "modified_sha256_exact": "e54e8c7f5f2c4618999fbbaa4e97ef177cd261029dc5458cf34f1e1bf5d95ee1",
+      "modified_sha256_in_patch": "e54e8c7f5f2c4618999fbbaa4e97ef177cd261029dc5458cf34f1e1bf5d95ee1",
+      "line_endings_normalized": false,
+      "target_line_ending": "LF",
+      "git_blob_old": "4725b7a3b2657cf1c83a035e7dd796ce51703745",
+      "git_blob_new": "d429130eb749c7a0a3c242814c94b4823fc2bf69"
+    },
+    {
       "path": "GPT_SoVITS/TTS_infer_pack/__init__.py",
       "category": "source-change",
       "original_bytes": 44,
@@ -126,14 +139,14 @@
       "path": "GPT_SoVITS/TTS_infer_pack/TTS.py",
       "category": "source-change",
       "original_bytes": 67630,
-      "modified_bytes": 74019,
+      "modified_bytes": 79536,
       "original_sha256": "ef63f91078ba9cafe427ba92d10bd52f2f8a8b1877befa2790b728fc93d3e8d0",
-      "modified_sha256_exact": "ddc759b4e931d8f25f8d88216ad379dc8bf983216725e1820ca042514517db99",
-      "modified_sha256_in_patch": "ddc759b4e931d8f25f8d88216ad379dc8bf983216725e1820ca042514517db99",
+      "modified_sha256_exact": "6f88a2fcf5e19066f1f25fb4e43886cc1a0ef34912f704b8c9b1d566fb5d714b",
+      "modified_sha256_in_patch": "6f88a2fcf5e19066f1f25fb4e43886cc1a0ef34912f704b8c9b1d566fb5d714b",
       "line_endings_normalized": false,
       "target_line_ending": "LF",
       "git_blob_old": "d20daee3691fe615e2ad4c7b2a531020986419e7",
-      "git_blob_new": "485ef2a3f8d11da2908f3d4a5bb1110a8679290f"
+      "git_blob_new": "680499245021273811ca1063f7147e8eb182a48c"
     },
     {
       "path": "GPT_SoVITS/TTS_infer_pack/TextPreprocessor.py",

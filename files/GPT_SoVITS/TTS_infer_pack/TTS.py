@@ -1129,15 +1129,18 @@ class TTS:
                 return
 
             batch_index_list: list = None
-            data, batch_index_list = self.to_batch(
-                data,
-                prompt_data=self.prompt_cache if not no_prompt_text else None,
-                batch_size=batch_size,
-                threshold=batch_threshold,
-                split_bucket=split_bucket,
-                device=self.configs.device,
-                precision=self.precision,
-            )
+            # 动态接活模式：保持「逐句」形态，分批交给 AR 层自己做（见下面的
+            # dynamic_batch 分支）—— 先 to_batch 成固定批就接不了活了。
+            if not inputs.get("dynamic_batch"):
+                data, batch_index_list = self.to_batch(
+                    data,
+                    prompt_data=self.prompt_cache if not no_prompt_text else None,
+                    batch_size=batch_size,
+                    threshold=batch_threshold,
+                    split_bucket=split_bucket,
+                    device=self.configs.device,
+                    precision=self.precision,
+                )
         elif not return_fragment:
             data = self.text_preprocessor.preprocess(text, text_lang, text_split_method, self.configs.version)
             if len(data) == 0:
@@ -1199,6 +1202,95 @@ class TTS:
             t_45 = 0.0
             audio = []
             output_sr = self.configs.sampling_rate if not self.configs.use_vocoder else self.vocoder_configs["sr"]
+            # ── 动态接活 + 逐句流式返回 ────────────────────────────────
+            # 上游批量循环要等一批里所有句子都 EOS 才算完；这里改成：谁空了就
+            # 补下一句，而且**每生成完一句立刻解码 + yield**，调用方收到就能落盘、
+            # 更新进度、给点读用 —— 不必等整批。
+            # yield 的格式是 (sr, [(原始句号, np数组), ...])。
+            if inputs.get("dynamic_batch") and not return_fragment and len(data) > 1:
+                try:
+                    pos = 0
+                    bs = max(1, min(int(batch_size or 1), len(data)))
+                    while pos < len(data):
+                        chunk = data[pos:pos + bs]
+                        batches, _ = self.to_batch(
+                            chunk,
+                            prompt_data=self.prompt_cache if not no_prompt_text else None,
+                            batch_size=len(chunk),
+                            threshold=batch_threshold,
+                            split_bucket=False,
+                            device=self.configs.device,
+                            precision=self.precision,
+                        )
+                        if not batches:
+                            break
+                        init = batches[0]
+                        # 后面的句子逐句预处理成 queue（一次只建一小段）
+                        queue = []
+                        for k, it in enumerate(data[pos + bs:pos + bs + 24]):
+                            qb, _ = self.to_batch(
+                                [it],
+                                prompt_data=self.prompt_cache if not no_prompt_text else None,
+                                batch_size=1,
+                                threshold=batch_threshold,
+                                split_bucket=False,
+                                device=self.configs.device,
+                                precision=self.precision,
+                            )
+                            if not qb:
+                                continue
+                            queue.append({
+                                "phones": qb[0]["all_phones"][0],
+                                "phones_len": qb[0]["all_phones_len"][0],
+                                "bert": qb[0]["all_bert_features"][0],
+                                "phones_only": qb[0]["phones"][0],
+                                "index": pos + bs + k,
+                            })
+                        max_len = max(
+                            [int(t.shape[0]) for t in init["all_phones"]]
+                            + [int(q["phones"].shape[0]) for q in queue] + [1])
+                        prompt = (self.prompt_cache["prompt_semantic"]
+                                  .expand(len(init["all_phones"]), -1).to(self.configs.device)
+                                  if not no_prompt_text else None)
+                        phones_all = [init["phones"][i] for i in range(len(init["phones"]))]
+                        phones_all += [q["phones_only"] for q in queue]
+
+                        n_done = 0
+                        for bi, y_tok, n_tok in self.t2s_model.model.infer_panel_batch_infer_dynamic_stream(
+                            init["all_phones"],
+                            init["all_phones_len"],
+                            prompt,
+                            init["all_bert_features"],
+                            top_k=top_k,
+                            top_p=top_p,
+                            temperature=temperature,
+                            early_stop_num=self.configs.hz * self.configs.max_sec,
+                            max_len=max_len,
+                            repetition_penalty=repetition_penalty,
+                            queue=queue,
+                        ):
+                            n_done = max(n_done, bi + 1)
+                            _pred = y_tok[-n_tok:].unsqueeze(0).unsqueeze(0)
+                            _ph = phones_all[bi].unsqueeze(0).to(self.configs.device)
+                            frag = self.using_vocoder_synthesis(
+                                _pred, _ph, speed=speed_factor, sample_steps=sample_steps)
+                            _, _arr = self.audio_postprocess(
+                                [[frag]], output_sr, None, speed_factor, False, fragment_interval,
+                                super_sampling if self.configs.use_vocoder and self.configs.version == "v3" else False)
+                            yield output_sr, [(pos + bi, _arr)]
+                        if n_done <= 0:
+                            break
+                        pos += n_done
+                        print(f"[dynamic] {pos}/{len(data)} 句")
+                    return
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    # data 这时是「逐句」形态，不能继续走静态批分支（会缺字段）。
+                    # 抛给调用方，由服务端退回 /tts_batch 或逐句合成。
+                    print(f"[dynamic] 动态批失败（{e}）")
+                    raise
+
             for item in data:
                 t3 = time.perf_counter()
                 if return_fragment:

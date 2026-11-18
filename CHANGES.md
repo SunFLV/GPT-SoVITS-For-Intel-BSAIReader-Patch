@@ -1,5 +1,27 @@
 # 修改明细
 
+## 动态接活 + 逐句流式 `/tts_batch_stream`（长文并行）
+
+- `GPT_SoVITS/AR/models/t2s_model.py` 新增 `infer_panel_batch_infer_dynamic_stream`：
+  - 上游批量推理在 EOS 时会把该句从 `y / attn_mask / k_cache / v_cache` 里
+    `index_select` 摘掉，所以"空位"天然存在 —— 这里在这个空位上**补下一句**，
+    槽位不再空到整批结束（真正的「算好一句接下一句」）
+  - 新序列的 KV 走一次单序列 prefill，右补 0 到当前 K 长度并整体 mask（只允许
+    看自己前面 `src_len` 列）；位置编码按**每序列自己的步数** gather，否则新
+    序列会用到别人的绝对位置，音色/节奏会崩
+  - EOS 那一刻 `attn_mask` 比 cache 多一列（上游给下一步的占位），插入时以
+    cache 长度为准裁掉，下一步主循环会重新 pad 回来
+  - generator：每生成完一句就 `yield (原始句号, tokens, 有效长度)`
+- `TTS_infer_pack/TTS.py`：`dynamic_batch` 输入下逐句解码（DiT/声码器）并逐句
+  `yield`；`texts` 分支在动态模式下不做 `to_batch`（需要保持"逐句"才能接活）
+- `api_v2.py` 新增 `POST /tts_batch_stream`：NDJSON，一句一行
+  `{"index": k, "wav": "<base64>"}`。**完成顺序不等于句序**（实测到达序
+  8,6,4,1,10,12…），调用方必须按 `index` 归位 —— 这是"顺序不会错"的保证
+- 实测（A770 / v5turbo，16 句长短混排）：总 136.3 s，16/16 句齐全；第 1 句
+  19.4 s 就可在点读里听（静态批要等整批 60 s 以上）；音频时长与句长相关性 0.94
+- 兜底：`dynamic_batch` 报错/老后端没有该端点 → 服务端退回 `/tts_batch`
+  静态批 → 再不行逐句；个别句子静音只补那一句
+
 ## 逐句批量推理 `/tts_batch`（长文并行）
 
 - 新增 `api_v2.py` 的 `POST /tts_batch`：请求体 = `/tts` 的全部参数 + `texts: [...]`，
