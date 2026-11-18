@@ -935,7 +935,7 @@ index 8579a63..230a50d 100644
 +# Keep package import lightweight so device_utils can be imported without
 +# pulling in torch/IPEX-dependent modules. Submodules are imported on demand.
 diff --git a/GPT_SoVITS/TTS_infer_pack/TTS.py b/GPT_SoVITS/TTS_infer_pack/TTS.py
-index d20daee..81f1349 100644
+index d20daee..09e5cad 100644
 --- a/GPT_SoVITS/TTS_infer_pack/TTS.py
 +++ b/GPT_SoVITS/TTS_infer_pack/TTS.py
 @@ -26,6 +26,7 @@
@@ -1005,7 +1005,18 @@ index d20daee..81f1349 100644
  
      def update_configs(self):
          self.config = {
-@@ -482,7 +489,15 @@
+@@ -472,7 +479,9 @@
+             raise FileExistsError(info)
+ 
+         # dict_s2 = torch.load(weights_path, map_location=self.configs.device,weights_only=False)
+-        dict_s2 = load_sovits_new(weights_path)
++        # Map weights straight onto the inference device instead of building a
++        # full CPU-RAM copy first (saves ~2 GiB private RAM on XPU).
++        dict_s2 = load_sovits_new(weights_path, device=self.configs.device, use_mmap=True)
+         hps = dict_s2["config"]
+ 
+         hps["model"]["semantic_frame_rate"] = "25hz"
+@@ -482,7 +491,15 @@
              hps["model"]["version"] = "v1"
          else:
              hps["model"]["version"] = "v2"
@@ -1022,7 +1033,7 @@ index d20daee..81f1349 100644
  
          self.configs.filter_length = hps["data"]["filter_length"]
          self.configs.segment_size = hps["train"]["segment_size"]
-@@ -498,7 +513,7 @@
+@@ -498,7 +515,7 @@
  
          # print(f"model_version:{model_version}")
          # print(f'hps["model"]["version"]:{hps["model"]["version"]}')
@@ -1031,7 +1042,29 @@ index d20daee..81f1349 100644
              vits_model = SynthesizerTrn(
                  self.configs.filter_length // 2 + 1,
                  self.configs.segment_size // self.configs.hop_length,
-@@ -586,7 +601,7 @@
+@@ -525,7 +542,7 @@
+             )
+         else:
+             print(
+-                f"Loading VITS pretrained weights from {weights_path}. {vits_model.load_state_dict(load_sovits_new(path_sovits)['weight'], strict=False)}"
++                f"Loading VITS pretrained weights from {weights_path}. {vits_model.load_state_dict(load_sovits_new(path_sovits, device=self.configs.device, use_mmap=True)['weight'], strict=False)}"
+             )
+             lora_rank = dict_s2["lora_rank"]
+             lora_config = LoraConfig(
+@@ -553,7 +570,11 @@
+         self.configs.t2s_weights_path = weights_path
+         self.configs.save_configs()
+         self.configs.hz = 50
+-        dict_s1 = torch.load(weights_path, map_location=self.configs.device)
++        try:
++            dict_s1 = torch.load(weights_path, map_location=self.configs.device,
++                                 mmap=True)
++        except (TypeError, RuntimeError, OSError):
++            dict_s1 = torch.load(weights_path, map_location=self.configs.device)
+         config = dict_s1["config"]
+         self.configs.max_sec = config["data"]["max_sec"]
+         t2s_model = Text2SemanticLightningModule(config, "****", is_train=False)
+@@ -586,7 +607,7 @@
              self.vocoder_configs["upsample_rate"] = 256
              self.vocoder_configs["overlapped_len"] = 12
  
@@ -1040,20 +1073,22 @@ index d20daee..81f1349 100644
              if self.vocoder is not None and self.vocoder.__class__.__name__ == "Generator":
                  return
              if self.vocoder is not None:
-@@ -605,7 +620,11 @@
+@@ -605,7 +626,13 @@
                          gin_channels=0, is_bias=True
                      )
              self.vocoder.remove_weight_norm()
 -            state_dict_g = torch.load("%s/GPT_SoVITS/pretrained_models/gsv-v4-pretrained/vocoder.pth" % (now_dir,), map_location="cpu")
 +            vocoder_dir = "gsv-v5-pretrained" if version in V5_VERSIONS else "gsv-v4-pretrained"
-+            state_dict_g = torch.load(
-+                "%s/GPT_SoVITS/pretrained_models/%s/vocoder.pth" % (now_dir, vocoder_dir),
-+                map_location="cpu", weights_only=False,
-+            )
++            vocoder_path = "%s/GPT_SoVITS/pretrained_models/%s/vocoder.pth" % (now_dir, vocoder_dir)
++            try:
++                state_dict_g = torch.load(vocoder_path, map_location=self.configs.device,
++                                          weights_only=False, mmap=True)
++            except (TypeError, RuntimeError, OSError):
++                state_dict_g = torch.load(vocoder_path, map_location="cpu", weights_only=False)
              print("loading vocoder",self.vocoder.load_state_dict(state_dict_g))
  
              self.vocoder_configs["sr"] = 48000
-@@ -671,12 +690,13 @@
+@@ -671,12 +698,13 @@
              if self.vocoder is not None:
                  self.vocoder = self.vocoder.float()
  
@@ -1069,7 +1104,7 @@ index d20daee..81f1349 100644
          self.configs.device = device
          if save:
              self.configs.save_configs()
-@@ -700,9 +720,18 @@
+@@ -700,9 +728,18 @@
          Args:
              ref_audio_path: str, the path of the reference audio.
          """
@@ -1088,7 +1123,7 @@ index d20daee..81f1349 100644
  
      def _set_ref_audio_path(self, ref_audio_path):
          self.prompt_cache["ref_audio_path"] = ref_audio_path
-@@ -955,7 +984,7 @@
+@@ -955,7 +992,7 @@
                      "seed": -1,                   # int. random seed for reproducibility.
                      "parallel_infer": True,       # bool. whether to use parallel inference.
                      "repetition_penalty": 1.35    # float. repetition penalty for T2S model.
@@ -1097,7 +1132,7 @@ index d20daee..81f1349 100644
                      "super_sampling": False,       # bool. whether to use super-sampling for audio when using VITS model V3.
                  }
          returns:
-@@ -984,7 +1013,8 @@
+@@ -984,7 +1021,8 @@
          actual_seed = set_seed(seed)
          parallel_infer = inputs.get("parallel_infer", True)
          repetition_penalty = inputs.get("repetition_penalty", 1.35)
@@ -1107,7 +1142,7 @@ index d20daee..81f1349 100644
          super_sampling = inputs.get("super_sampling", False)
  
          if parallel_infer:
-@@ -1024,7 +1054,7 @@
+@@ -1024,7 +1062,7 @@
              assert prompt_lang in self.configs.languages
  
          if no_prompt_text and self.configs.use_vocoder:
@@ -1116,7 +1151,7 @@ index d20daee..81f1349 100644
  
          if ref_audio_path in [None, ""] and (
              (self.prompt_cache["prompt_semantic"] is None) or (self.prompt_cache["refer_spec"] in [None, []])
-@@ -1298,10 +1328,7 @@
+@@ -1298,10 +1336,7 @@
      def empty_cache(self):
          try:
              gc.collect()  # 触发gc的垃圾回收。避免内存一直增长。
@@ -1128,7 +1163,7 @@ index d20daee..81f1349 100644
          except:
              pass
  
-@@ -1360,8 +1387,11 @@
+@@ -1360,8 +1395,11 @@
          return sr, audio
  
      def using_vocoder_synthesis(
@@ -1141,7 +1176,7 @@ index d20daee..81f1349 100644
          prompt_semantic_tokens = self.prompt_cache["prompt_semantic"].unsqueeze(0).unsqueeze(0).to(self.configs.device)
          prompt_phones = torch.LongTensor(self.prompt_cache["phones"]).unsqueeze(0).to(self.configs.device)
          refer_audio_spec = self.prompt_cache["refer_spec"][0].to(dtype=self.precision, device=self.configs.device)
-@@ -1380,6 +1410,13 @@
+@@ -1380,6 +1418,13 @@
  
          mel2 = mel_fn(ref_audio) if self.configs.version == "v3" else mel_fn_v4(ref_audio)
          mel2 = norm_spec(mel2)
@@ -1155,7 +1190,7 @@ index d20daee..81f1349 100644
          T_min = min(mel2.shape[2], fea_ref.shape[2])
          mel2 = mel2[:, :, :T_min]
          fea_ref = fea_ref[:, :, :T_min]
-@@ -1427,8 +1464,20 @@
+@@ -1427,8 +1472,20 @@
          semantic_tokens_list: List[torch.Tensor],
          batch_phones: List[torch.Tensor],
          speed: float = 1.0,
@@ -1200,7 +1235,7 @@ index 426929f..9b9f39a 100644
          print(text)
  
 diff --git a/GPT_SoVITS/configs/tts_infer.yaml b/GPT_SoVITS/configs/tts_infer.yaml
-index 20c41a2..d503bf6 100644
+index 20c41a2..f84fc05 100644
 --- a/GPT_SoVITS/configs/tts_infer.yaml
 +++ b/GPT_SoVITS/configs/tts_infer.yaml
 @@ -1,40 +1,57 @@
@@ -1274,7 +1309,7 @@ index 20c41a2..d503bf6 100644
 +  device: xpu
 +  is_half: true
 +  version: v5turbo
-+  t2s_weights_path: GPT_weights_v4/sunflv.ckpt
++  t2s_weights_path: D:/BSAIReader/SunFLV/GPT_weights_v4/SunFLV_v4-e15.ckpt
 +  vits_weights_path: GPT_SoVITS/pretrained_models/gsv-v5-pretrained/s2Gv5turbo.pth
    bert_base_path: GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large
    cnhuhbert_base_path: GPT_SoVITS/pretrained_models/chinese-hubert-base
@@ -2163,7 +2198,7 @@ index 7493f0b..6fa84a4 100644
  
  
 diff --git a/GPT_SoVITS/process_ckpt.py b/GPT_SoVITS/process_ckpt.py
-index 4a2a1ba..8f362af 100644
+index 4a2a1ba..6d50f5a 100644
 --- a/GPT_SoVITS/process_ckpt.py
 +++ b/GPT_SoVITS/process_ckpt.py
 @@ -17,29 +17,30 @@
@@ -2258,12 +2293,39 @@ index 4a2a1ba..8f362af 100644
  }
  import hashlib
  
-@@ -115,7 +138,7 @@
- def load_sovits_new(sovits_path):
-     f = open(sovits_path, "rb")
-     meta = f.read(2)
+@@ -112,13 +135,28 @@
+     return version, model_version, if_lora_v3
+ 
+ 
+-def load_sovits_new(sovits_path):
+-    f = open(sovits_path, "rb")
+-    meta = f.read(2)
 -    if meta != "PK":
+-        data = b"PK" + f.read()
+-        bio = BytesIO()
+-        bio.write(data)
++def load_sovits_new(sovits_path, device="cpu", use_mmap=False):
++    """Load a SoVITS checkpoint.
++
++    device="xpu" + use_mmap=True maps the file into the page cache and
++    materializes tensors straight on the device, avoiding a full CPU-RAM
++    deserialization copy (~2.1 GiB private RAM saved for a 730 MiB weights
++    file). Falls back to the original CPU load if mmap is unsupported or the
++    checkpoint is the legacy non-ZIP format that needs the PK prefix patched.
++    """
++    with open(sovits_path, "rb") as f:
++        meta = f.read(2)
 +    if meta != b"PK":
-         data = b"PK" + f.read()
-         bio = BytesIO()
-         bio.write(data)
++        # Legacy tar-style checkpoint: must prepend PK, so it cannot be mmap'd.
++        with open(sovits_path, "rb") as f:
++            data = b"PK" + f.read()
++        bio = BytesIO(data)
+         bio.seek(0)
+         return torch.load(bio, map_location="cpu", weights_only=False)
++    if use_mmap:
++        try:
++            return torch.load(sovits_path, map_location=device,
++                              weights_only=False, mmap=True)
++        except (TypeError, RuntimeError, OSError) as e:
++            print(f"mmap load failed ({e}); falling back to CPU load.")
+     return torch.load(sovits_path, map_location="cpu", weights_only=False)

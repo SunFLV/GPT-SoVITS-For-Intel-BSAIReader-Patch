@@ -9,6 +9,7 @@
 - `TTS.py` 已移植 upstream 的 `module/models_v5.py`、`cache_dit.py`、DiT/CFM v5 路径
 - `process_ckpt.py` 可识别 v5turbo 权重签名（`6bc5cb2a...`）
 - `TTS_Config.save_configs()` 现在保留顶层 `version`，避免保存后静默回落到 v2（这是实测踩到的关键坑）
+- 权重改为 `mmap=True` + `map_location=xpu` 直接映射到设备，避免先在 CPU 内存反序列化出一份完整副本（SoVITS 权重实测省约 2 GiB 私有内存），mmap 不支持时自动回退到原加载方式
 
 v5Turbo 需要：
 

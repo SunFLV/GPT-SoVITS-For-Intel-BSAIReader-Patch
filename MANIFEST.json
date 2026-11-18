@@ -113,14 +113,14 @@
       "path": "GPT_SoVITS/TTS_infer_pack/TTS.py",
       "category": "source-change",
       "original_bytes": 67630,
-      "modified_bytes": 70519,
+      "modified_bytes": 71178,
       "original_sha256": "ef63f91078ba9cafe427ba92d10bd52f2f8a8b1877befa2790b728fc93d3e8d0",
-      "modified_sha256_exact": "1e37a6bcbff45825e24bf3a3f749750de68424e8c536b82d29c86161b5fdfa66",
-      "modified_sha256_in_patch": "1e37a6bcbff45825e24bf3a3f749750de68424e8c536b82d29c86161b5fdfa66",
+      "modified_sha256_exact": "90d3364399edcdec33cbc0213f481b4db857840cb1716b4b4b0fbe58fe2921e1",
+      "modified_sha256_in_patch": "90d3364399edcdec33cbc0213f481b4db857840cb1716b4b4b0fbe58fe2921e1",
       "line_endings_normalized": false,
       "target_line_ending": "LF",
       "git_blob_old": "d20daee3691fe615e2ad4c7b2a531020986419e7",
-      "git_blob_new": "81f13495563a12086bf845e96296b219961a4b1e"
+      "git_blob_new": "09e5cadd777ccb3212415170a689cf37c3104381"
     },
     {
       "path": "GPT_SoVITS/TTS_infer_pack/TextPreprocessor.py",
@@ -139,14 +139,14 @@
       "path": "GPT_SoVITS/configs/tts_infer.yaml",
       "category": "source-change",
       "original_bytes": 1821,
-      "modified_bytes": 2517,
+      "modified_bytes": 2545,
       "original_sha256": "f18e7ea2ea6e9a7a25c3138e5051839797dcb4c4aedde5ed49af852c7aa85176",
-      "modified_sha256_exact": "7afe6db3eaa303d1ead15282a4fb641bf3f06452bb4a7b52463b08bc5e14ff84",
-      "modified_sha256_in_patch": "d58908b067ee8dee89123ca32363f697e97550ab63dfe5548392d212913cdc3f",
+      "modified_sha256_exact": "943898af202ed536324ccdca8d490ac3b4ffd72256337a49addb42e94f93734b",
+      "modified_sha256_in_patch": "c9ad36f074423b3a7d5ed7ddc1e5367faa900786d781a4c2a8e3ab29cc43574b",
       "line_endings_normalized": true,
       "target_line_ending": "LF",
       "git_blob_old": "20c41a20ae26a746d37e079a39e29d7af6b4513c",
-      "git_blob_new": "d503bf60ddfb019a79a7dfb008126c9a29d94b8f"
+      "git_blob_new": "f84fc05ec0b4d5e0f89f3e98568e3cefbf2fcabe"
     },
     {
       "path": "GPT_SoVITS/f5_tts/model/__init__.py",
@@ -230,14 +230,14 @@
       "path": "GPT_SoVITS/process_ckpt.py",
       "category": "source-change",
       "original_bytes": 3604,
-      "modified_bytes": 4525,
+      "modified_bytes": 5387,
       "original_sha256": "bf37ff869d4ac01a6e60983169104a3a07225064b75a22aec3035d24639af6b5",
-      "modified_sha256_exact": "2326b6fe944e190620d9460420e2125b74f68022d8bef6cc784ae17b2079ee29",
-      "modified_sha256_in_patch": "2326b6fe944e190620d9460420e2125b74f68022d8bef6cc784ae17b2079ee29",
+      "modified_sha256_exact": "f01722ff3e6e56e88257d5530b61859a73c7acfbfd9275416cf1bf015519dda4",
+      "modified_sha256_in_patch": "f01722ff3e6e56e88257d5530b61859a73c7acfbfd9275416cf1bf015519dda4",
       "line_endings_normalized": false,
       "target_line_ending": "CRLF",
       "git_blob_old": "4a2a1bacd6c5c67b370f5716127a9d38e77c012a",
-      "git_blob_new": "8f362afa6b65346352ff211136fdd2ce03316049"
+      "git_blob_new": "6d50f5a24ac06522b1062f65e41842d0abef6aee"
     },
     {
       "path": "weight.json",

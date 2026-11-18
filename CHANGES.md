@@ -1,5 +1,15 @@
 # 修改明细
 
+## mmap 权重加载（省内存）
+
+- `process_ckpt.py`：`load_sovits_new()` 新增 `device` / `use_mmap` 参数，标准 ZIP 检查点用 `mmap=True` 直接映射到指定设备；旧版非 ZIP 格式无法 mmap，保持原 CPU 加载；mmap 抛异常时自动回退
+- `TTS_infer_pack/TTS.py`：
+  - `init_vits_weights()` 调用 `load_sovits_new(..., device=xpu, use_mmap=True)`
+  - `init_t2s_weights()` 用 `torch.load(..., map_location=device, mmap=True)`，失败回退
+  - `init_vocoder()` 同样改为 mmap 直连设备，失败回退 CPU
+- 实测：SoVITS 权重文件 731 MB，传统 CPU 加载进程私有内存 2088 MB、工作集 1020 MB；mmap+XPU 为 1585 MB / 288 MB
+- 代价：首次模型加载从约 5 s 增至约 27 s（mmap 页首次载入设备）；换来的低内存驻留适合内存受限机器
+
 ## v5Turbo 推理支持
 
 - 新增 `GPT_SoVITS/module/models_v5.py`（`CFMV5`、`synthesize_v5_mel`、v5 常量）

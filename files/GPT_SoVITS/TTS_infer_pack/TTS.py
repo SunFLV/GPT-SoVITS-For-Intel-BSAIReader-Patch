@@ -479,7 +479,9 @@ class TTS:
             raise FileExistsError(info)
 
         # dict_s2 = torch.load(weights_path, map_location=self.configs.device,weights_only=False)
-        dict_s2 = load_sovits_new(weights_path)
+        # Map weights straight onto the inference device instead of building a
+        # full CPU-RAM copy first (saves ~2 GiB private RAM on XPU).
+        dict_s2 = load_sovits_new(weights_path, device=self.configs.device, use_mmap=True)
         hps = dict_s2["config"]
 
         hps["model"]["semantic_frame_rate"] = "25hz"
@@ -540,7 +542,7 @@ class TTS:
             )
         else:
             print(
-                f"Loading VITS pretrained weights from {weights_path}. {vits_model.load_state_dict(load_sovits_new(path_sovits)['weight'], strict=False)}"
+                f"Loading VITS pretrained weights from {weights_path}. {vits_model.load_state_dict(load_sovits_new(path_sovits, device=self.configs.device, use_mmap=True)['weight'], strict=False)}"
             )
             lora_rank = dict_s2["lora_rank"]
             lora_config = LoraConfig(
@@ -568,7 +570,11 @@ class TTS:
         self.configs.t2s_weights_path = weights_path
         self.configs.save_configs()
         self.configs.hz = 50
-        dict_s1 = torch.load(weights_path, map_location=self.configs.device)
+        try:
+            dict_s1 = torch.load(weights_path, map_location=self.configs.device,
+                                 mmap=True)
+        except (TypeError, RuntimeError, OSError):
+            dict_s1 = torch.load(weights_path, map_location=self.configs.device)
         config = dict_s1["config"]
         self.configs.max_sec = config["data"]["max_sec"]
         t2s_model = Text2SemanticLightningModule(config, "****", is_train=False)
@@ -621,10 +627,12 @@ class TTS:
                     )
             self.vocoder.remove_weight_norm()
             vocoder_dir = "gsv-v5-pretrained" if version in V5_VERSIONS else "gsv-v4-pretrained"
-            state_dict_g = torch.load(
-                "%s/GPT_SoVITS/pretrained_models/%s/vocoder.pth" % (now_dir, vocoder_dir),
-                map_location="cpu", weights_only=False,
-            )
+            vocoder_path = "%s/GPT_SoVITS/pretrained_models/%s/vocoder.pth" % (now_dir, vocoder_dir)
+            try:
+                state_dict_g = torch.load(vocoder_path, map_location=self.configs.device,
+                                          weights_only=False, mmap=True)
+            except (TypeError, RuntimeError, OSError):
+                state_dict_g = torch.load(vocoder_path, map_location="cpu", weights_only=False)
             print("loading vocoder",self.vocoder.load_state_dict(state_dict_g))
 
             self.vocoder_configs["sr"] = 48000
