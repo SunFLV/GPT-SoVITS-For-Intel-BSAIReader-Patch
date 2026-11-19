@@ -36,6 +36,42 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
+def _load_capabilities():
+    """找补丁安装在后端根目录的 bsai_capabilities.py。
+
+    池服务自身可能被放在任意目录（独立部署），所以按「脚本目录 → 上层目录 →
+    BSAI_BACKEND_DIR → 当前目录」逐个找，找到就按文件加载，找不到返回 None
+    （老后端没有该文件时，池服务行为完全不变）。
+    """
+    try:
+        import bsai_capabilities as mod       # 和后端同目录时的常规情况
+        return mod
+    except Exception:
+        pass
+    import importlib.util
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    cands = [here] + [os.path.dirname(here)]
+    base = os.environ.get("BSAI_BACKEND_DIR")
+    if base:
+        cands.append(base)
+    cands.append(os.getcwd())
+    for d in cands:
+        f = os.path.join(d, "bsai_capabilities.py")
+        if not os.path.isfile(f):
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location("bsai_capabilities", f)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+        except Exception as exc:              # pragma: no cover
+            print(f"[api_pool] bsai_capabilities 加载失败 {f}: {exc!r}", flush=True)
+    return None
+
+
+_bsai_caps = _load_capabilities()
+
 from tts_pool import (
     DEFAULT_CONFIG,
     PROJECT_ROOT,
@@ -222,6 +258,21 @@ def _base_inputs(body: dict) -> dict:
             out.setdefault("prompt_text", CFG["default_prompt_text"])
         out.setdefault("prompt_lang", CFG.get("default_prompt_lang") or "zh")
     out.setdefault("text_lang", CFG.get("default_text_lang") or "zh")
+
+    # 音色名 → 参考音：客户端可以只传 voice:"v4_default"（或把音色名当
+    # ref_wav_path 传），由这台机器的 BSAI_VOICES.json 解析出路径与 prompt。
+    # 传的是真实存在的文件路径时保持原行为，不做任何改写。
+    want = out.pop("voice", None)
+    cand = want if want else out.get("ref_audio_path")
+    if _bsai_caps is not None and isinstance(cand, str) and cand:
+        if not (os.path.isabs(cand) and os.path.exists(cand)):
+            hit = _bsai_caps.resolve_voice(cand)
+            if hit:
+                out["ref_audio_path"] = hit["ref_audio_path"]
+                out.setdefault("prompt_text", hit.get("prompt_text") or "")
+                out.setdefault("prompt_lang", hit.get("prompt_lang") or "ja")
+                out.setdefault("text_lang", hit.get("text_lang") or "zh")
+
     if out.get("sample_steps") is None and CFG.get("default_sample_steps"):
         out["sample_steps"] = int(CFG["default_sample_steps"])
     if "ref_audio_path" not in out:
@@ -391,6 +442,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="GPT-SoVITS Pool API", version="2.0", lifespan=lifespan)
 
+# [BSAIReader] 自报能力：装了补丁的机器能直接告诉前端「我支持哪些模型/音色」，
+# 不必为了看音色列表再部署一层代理。
+if _bsai_caps is not None:
+    try:
+        _bsai_caps.attach(app)
+        print(f"[api_pool] capabilities mounted: "
+              f"{_bsai_caps.capabilities()['backend_capabilities']}", flush=True)
+    except Exception as exc:           # pragma: no cover
+        print(f"[api_pool] capabilities not mounted: {exc!r}", flush=True)
+
 
 class DynamicCORS:
     """按请求读取 CFG 的 CORS（因为配置可能在 main() 里才由 CLI 补齐）。"""
@@ -490,6 +551,9 @@ def index():
             "GET /health": "池状态与统计",
             "GET /healthz": "存活探针",
             "GET /readyz": "就绪探针",
+            "GET /api/voices": "音色 + 模型版本（自报能力）",
+            "GET /api/models": "本机支持的模型版本",
+            "GET /api/capabilities": "完整能力清单",
             "GET /docs": "OpenAPI",
         },
         "auth": "api-key" if API_KEY else "open",

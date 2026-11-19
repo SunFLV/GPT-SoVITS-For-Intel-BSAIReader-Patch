@@ -148,11 +148,26 @@ tts_pipeline = TTS(tts_config)
 
 APP = FastAPI()
 
+# [BSAIReader] 自报能力：/api/capabilities、/api/models、/api/voices
+# 读同目录的 BSAI_PATCH.json / BSAI_VOICES.json（补丁安装时生成）。
+# 前端「服务器选择」切换过来就能读到这台支持哪些模型、有哪些音色，
+# 不必为此再部署一层代理。文件缺失时静默跳过，不影响原有接口。
+try:
+    import bsai_capabilities as _bsai_caps
+
+    _bsai_caps.attach(APP)
+    print(f"[BSAI] capabilities mounted: {_bsai_caps.capabilities()['backend_capabilities']}")
+except Exception as _e:  # pragma: no cover - 老后端/未装补丁
+    print(f"[BSAI] capabilities not mounted: {_e!r}")
+
 
 class TTS_Request(BaseModel):
     text: str = None
     text_lang: str = None
     ref_audio_path: str = None
+    # [BSAIReader] 音色名（BSAI_VOICES.json 里的 name）。给了它就可以不传
+    # ref_audio_path / prompt_text / prompt_lang，由本机清单解析补齐。
+    voice: str = None
     aux_ref_audio_paths: list = None
     prompt_lang: str = None
     prompt_text: str = ""
@@ -172,6 +187,30 @@ class TTS_Request(BaseModel):
     repetition_penalty: float = 1.35
     sample_steps: int = 32
     super_sampling: bool = False
+
+
+def _apply_voice(req: dict):
+    """[BSAIReader] 音色名 → 参考音：/api/voices 列出的 name（如 v4_default）
+    可以直接当 voice 传，由本机 BSAI_VOICES.json 解析出 ref_audio_path 与
+    prompt_text / prompt_lang / text_lang。传真实文件路径时行为完全不变。
+    """
+    want = req.pop("voice", None) or req.get("ref_audio_path")
+    if not want:
+        return
+    try:
+        import bsai_capabilities as _caps
+
+        hit = _caps.resolve_voice(want)
+    except Exception:
+        return
+    if not hit:
+        return
+    req["ref_audio_path"] = hit["ref_audio_path"]
+    for k, d in (("prompt_text", hit.get("prompt_text") or ""),
+                 ("prompt_lang", hit.get("prompt_lang") or "ja"),
+                 ("text_lang", hit.get("text_lang") or "zh")):
+        if not req.get(k):
+            req[k] = d
 
 
 ### modify from https://github.com/RVC-Boss/GPT-SoVITS/pull/894/files
@@ -337,6 +376,8 @@ async def tts_handle(req: dict):
     return_fragment = req.get("return_fragment", False)
     media_type = req.get("media_type", "wav")
 
+    _apply_voice(req)          # 音色名 → 参考音（传真实路径时无副作用）
+
     check_res = check_params(req)
     if check_res is not None:
         return check_res
@@ -470,6 +511,7 @@ async def tts_batch_endpoint(request: dict):
     req.setdefault("text_lang", "zh")
     req.setdefault("media_type", "wav")
     req.setdefault("text_split_method", "cut0")
+    _apply_voice(req)          # 批量同样支持 voice: "v4_tomori"
 
     check_res = check_params(req)
     if check_res is not None:
@@ -520,6 +562,7 @@ def tts_batch_stream_endpoint(request: dict):
     req.setdefault("text_lang", "zh")
     req.setdefault("media_type", "wav")
     req.setdefault("text_split_method", "cut0")
+    _apply_voice(req)          # 流式同样支持 voice: "v4_tomori"
 
     def gen():
         try:

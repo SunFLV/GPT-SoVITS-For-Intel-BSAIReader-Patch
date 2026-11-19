@@ -49,31 +49,65 @@ GPT_SoVITS/pretrained_models/gsv-v5-pretrained/vocoder.pth
 
 ## 主补丁文件
 
-新增 3 个：`device_utils.py`、`module/cache_dit.py`、`module/models_v5.py`。修改 16 个（含 `api_v2.py`），共 19 个文件。`files/` 是应用后的完整文件，`MANIFEST.json` 是机器可读清单，`CHANGES.md` 是逐项说明。
+新增 4 个：`bsai_capabilities.py`、`device_utils.py`、`module/cache_dit.py`、`module/models_v5.py`。修改 16 个（含 `api_v2.py`），共 20 个文件。`files/` 是应用后的完整文件，`MANIFEST.json` 是机器可读清单，`CHANGES.md` 是逐项说明。
 
-## 应用后自动声明能力（`BSAI_PATCH.json`）
+## 自报能力：`/api/voices`、`/api/models`、`/api/capabilities`
 
-`apply_patch.sh` / `apply_patch.ps1` 应用成功后会调用 `write_capabilities.py`，
-在后端根目录写一个 `BSAI_PATCH.json`（**只新增这一个文件，不改后端源码**）：
+**这台机器支持哪些模型、有哪些音色，由后端自己回答**，不需要额外部署前端或代理层。
+
+补丁在 `api_v2.py` 里挂载三条只读路由（`bsai_capabilities.py` 提供）：
+
+| 路由 | 内容 |
+|---|---|
+| `GET /api/voices` | `{voices, versions, default_version, backend_capabilities, server_name, voice_details}` —— 与 bsai 代理层**完全同构**，前端读到任意一家的返回都长一样 |
+| `GET /api/models` | 本机可用的模型版本 + 标签 |
+| `GET /api/capabilities` | 完整清单（含补丁特性、音色明细、后端路径） |
+
+数据来自两个纯数据文件（安装时生成，不改后端源码）：
 
 ```json
-{
-  "patch": "BSAIReader GPT-SoVITS-For-Intel patch",
-  "models": ["v4", "v5turbo"],
-  "features": {
-    "batch_synthesize": "/tts_batch",
-    "stream_synthesize": "/tts_batch_stream",
-    "mmap_weights": true,
-    "device_agnostic": true
-  }
-}
+// BSAI_PATCH.json —— 补丁声明
+{"patch": "...", "models": ["v4", "v5turbo"],
+ "features": {"batch_synthesize": "/tts_batch", "capabilities": "/api/capabilities", ...},
+ "server_name": "本机 A770"}
+
+// BSAI_VOICES.json —— 音色清单（路径相对后端根目录，可跨机器）
+{"voices": [{"name": "v4_default", "description": "高松灯-叙述", "text_lang": "zh",
+             "prompt_lang": "ja", "ref_audio_path": "bsai/voices/default_ref.mp3",
+             "prompt_text": "そよちゃん、部活でコントラバス、だっけ"}]}
 ```
 
-`bsai/` 附加包启动时读它（再和后端 `tts_infer.yaml` 里的版本段取交集），
-决定这台机器对外宣称支持哪些模型 —— 前端「服务器选择」切换时展示的模型
-列表就来自这里。只装了一半补丁的机器不会误报能力。
+生成时会和 `GPT_SoVITS/configs/tts_infer.yaml` 里真实存在的版本段取交集，
+所以**只装了一半补丁的机器不会误报 v5turbo**。
 
-手工补写：`python write_capabilities.py <后端根目录>`
+音色来源按优先级：`--voices-json` 指定（bsai 的 `config_intel.yaml` 也能直接用，
+YAML/JSON 都认）→ 已有 `BSAI_VOICES.json` → `bsai/config_intel.yaml` → 扫
+`voices/ ref_audios/ SunFLV/Reference_Voices/`。绝对路径若在后端目录外，
+会自动在根目录里找同名副本并改写成相对路径，换台机器也能用。
+
+### 顺带：可以直接用音色名合成
+
+`/tts`、`/tts_batch`、`/tts_batch_stream` 现在都接受 `voice`（或把音色名当
+`ref_audio_path` 传）：
+
+```json
+{"text": "测试", "voice": "v4_tomori"}
+```
+
+后端按 `BSAI_VOICES.json` 解析出参考音路径与 `prompt_text / prompt_lang /
+text_lang`，调用方不必知道那台机器的文件布局。传真实文件路径时行为不变。
+
+### 安装/重建
+
+```bash
+python write_capabilities.py <后端根目录>
+python write_capabilities.py <后端根目录> --voices-json D:/BSAIReader/server/config_intel.yaml --name "本机 A770"
+python bsai_capabilities.py          # 命令行自查当前清单
+```
+
+`apply_patch.sh` / `apply_patch.ps1` 应用成功后会自动调用一次（名字默认取机器名）。
+池服务（`optional/generic-pool-service`）也挂了同样三条路由，且 `/api/voices`
+不需要 `X-API-Key`（只读元数据），方便前端在服务器下拉里直接读。
 
 ## 应用
 
@@ -85,7 +119,7 @@ git -c core.autocrlf=false apply    <path>/bsaireader-gpt-sovits.patch
 
 ## 验证
 
-补丁可从原版 ZIP 还原后干净应用，18 个输出文件与 `files/` 逐字节一致；Python 编译通过；`TTS_Config` 解析为 `version=v5turbo`，保存再加载仍为 v5turbo。
+补丁可从原版 ZIP 还原后干净应用，19 个输出文件与 `files/` 逐字节一致；Python 编译通过；`TTS_Config` 解析为 `version=v5turbo`，保存再加载仍为 v5turbo。
 
 ## 本机速度参考（Intel Arc A770 / XPU / fp16）
 

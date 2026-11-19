@@ -6,6 +6,19 @@
   "model_version": "v5turbo default; v4 still available; v2 removed from defaults and UI choices",
   "files": [
     {
+      "path": "bsai_capabilities.py",
+      "category": "new-file",
+      "original_bytes": 0,
+      "modified_bytes": 10184,
+      "original_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "modified_sha256_exact": "65c80de364993446ee0fb298e6484060e21f3d93a2fdfab677d7b4c0e6d083b1",
+      "modified_sha256_in_patch": "65c80de364993446ee0fb298e6484060e21f3d93a2fdfab677d7b4c0e6d083b1",
+      "line_endings_normalized": false,
+      "target_line_ending": "LF",
+      "git_blob_old": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "git_blob_new": "b36b45b4fd3ecf789a41fe8a19bb6cbcce6d7ac3"
+    },
+    {
       "path": "GPT_SoVITS/TTS_infer_pack/device_utils.py",
       "category": "new-file",
       "original_bytes": 0,
@@ -48,14 +61,14 @@
       "path": "api_v2.py",
       "category": "source-change",
       "original_bytes": 18507,
-      "modified_bytes": 22610,
+      "modified_bytes": 24544,
       "original_sha256": "2293a747564359440f03c5062ece6d96c308f3fb4d6d2ed1a9c0fbf87d38aae3",
-      "modified_sha256_exact": "3cd30a2ec92b05f9d90d7f086b9588f153be999190d8f8f7afd4d5d113fc1b17",
-      "modified_sha256_in_patch": "3cd30a2ec92b05f9d90d7f086b9588f153be999190d8f8f7afd4d5d113fc1b17",
+      "modified_sha256_exact": "590d98dc09af53812b47b36783b2d82f5d5991e984d786c5862bf13647b24fdd",
+      "modified_sha256_in_patch": "590d98dc09af53812b47b36783b2d82f5d5991e984d786c5862bf13647b24fdd",
       "line_endings_normalized": false,
       "target_line_ending": "LF",
       "git_blob_old": "8708207432d2ec53a99b4e4e53cfbdaa57dd2769",
-      "git_blob_new": "8fd7666257dd9958a10ee72f045685f283d335f1"
+      "git_blob_new": "43332f25e3fd08f4b5e56649a0c45383c62f1a1c"
     },
     {
       "path": "config.py",

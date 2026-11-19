@@ -75,6 +75,28 @@ curl -N -X POST http://127.0.0.1:9881/tts_batch_stream -H "Content-Type: applica
 
 > 中文请求体请用 UTF-8 文件 + `--data-binary "@body.json"`，PowerShell 直接 `-d '{"text":"中文"}'` 会乱码。
 
+### 自报能力（无需 API Key）
+
+装了主补丁后，池服务也会挂上三条只读路由 —— 前端「服务器选择」切过来就能读到
+这台支持哪些模型、有哪些音色，不必再部署一层代理：
+
+```bash
+curl http://127.0.0.1:9881/api/voices        # {voices, versions, default_version, ...}
+curl http://127.0.0.1:9881/api/models
+curl http://127.0.0.1:9881/api/capabilities
+```
+
+数据来自后端根目录的 `BSAI_PATCH.json` / `BSAI_VOICES.json`（主补丁安装时生成）。
+`bsai_capabilities.py` 按「脚本目录 → 上层目录 → `BSAI_BACKEND_DIR` → cwd」查找，
+所以池服务单独放在别的目录也能用；找不到时这三条路由不挂载，其余行为不变。
+
+拿到音色名后还能直接合成，不用关心那台的文件布局：
+
+```bash
+curl -X POST http://127.0.0.1:9881/ -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+     -d '{"text":"测试。","voice":"v4_default"}'
+```
+
 ## 配置要点（完整字段见 `config.pool_api.example.json` 与 `instance-pool.md`）
 
 | 字段 | 作用 |

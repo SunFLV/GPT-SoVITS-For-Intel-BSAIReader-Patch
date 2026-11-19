@@ -1,3 +1,27 @@
+# 自报能力（`/api/voices` / `/api/models` / `/api/capabilities`）
+
+新增文件 `bsai_capabilities.py`，并在 `api_v2.py` 的 `APP = FastAPI()` 之后挂载：
+
+| 路由 | 用途 |
+|---|---|
+| `GET /api/voices` | 音色 + 模型版本，字段与 bsai 代理层 `/api/voices` 完全一致 |
+| `GET /api/models` | 本机可用模型版本 |
+| `GET /api/capabilities` | 完整清单（模型 / 特性 / 音色明细 / 机器名） |
+
+要点：
+
+- 数据来自 `BSAI_PATCH.json`（补丁声明）与 `BSAI_VOICES.json`（音色清单），
+  两者都是安装时生成的新增文件，**不改后端源码**
+- 模型列表取「补丁声明 ∩ `tts_infer.yaml` 里真实存在的版本段」，只装一半补丁
+  的机器不会误报 v5turbo
+- 音色路径统一相对化；绝对路径落在后端目录外时，会在 `bsai/ voices/ ref_audios/`
+  里找同名副本并改写，因此清单可以跨机器拷贝
+- `/tts`、`/tts_batch`、`/tts_batch_stream` 新增 `voice` 参数：可直接传
+  `v4_tomori` 这样的音色名，由清单解析出参考音与 prompt；传真实路径行为不变
+- `optional/generic-pool-service/api_pool.py` 同样挂载这三条路由，并按
+  「脚本目录 → 上层 → `BSAI_BACKEND_DIR` → cwd」查找 `bsai_capabilities.py`，
+  池服务独立部署也能用；`/api/voices` 不要求 `X-API-Key`（只读元数据）
+
 # 修改明细
 
 ## 2026-11-19 可选附加件：后端中立的多进程实例池服务（`optional/generic-pool-service/`）
