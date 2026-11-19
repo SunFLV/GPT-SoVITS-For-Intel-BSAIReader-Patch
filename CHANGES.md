@@ -1,5 +1,20 @@
 # 修改明细
 
+## 2026-11-19 可选附加件：后端中立的多进程实例池服务（`optional/generic-pool-service/`）
+
+- 新增**可选**附加件，不属于主补丁 `bsaireader-gpt-sovits.patch`，不影响补丁的还原/逐字节校验
+- 内容：`api_pool.py` + `tts_pool.py` + `tts_worker.py` + 配置模板 + 启动脚本 + 基准/测试 + 文档
+- 定位：把「多路并发服务端」从 in-model 动态接活改成**进程池**实现，不改 AR 的 KV/位置编码，
+  因此在 CUDA / ROCm / Intel XPU / Apple MPS / DirectML / CPU 上都能用
+- 关键能力：三层配置（CLI > 环境变量 > `config/pool_api.json`）、`default_ref_audio`（客户端只传 text）、
+  `/tts_batch`、`/tts_batch_stream`（NDJSON 逐句返回，按 index 归位）、`/healthz` `/readyz`、
+  `queue_timeout` 超时 503、`max_text_chars` 超限 400、CORS、API Key、IPv6 双栈
+- 本机实测（RX 9070 XT / ROCm / v5turbo / 4 步 / 40 字文本）：
+  单实例 RTF ≈ 0.31；3 进程 2.99×（8.8 倍实时）；4 进程 3.52×（9.4 倍实时）；约 1.75 GB 显存/实例
+- 反向结论（一并记录，避免再走弯路）：同进程多线程 + 多 CUDA Stream 只有 0.62–0.79×，
+  因为 AR 逐 token 的 Python 循环被 GIL 串行化 —— 必须多进程；父进程导入 torch 后再 spawn 会触发
+  ROCm `hipErrorInvalidImage`，故父进程不导入 torch、worker 用 subprocess 拉起
+
 ## 动态接活 + 逐句流式 `/tts_batch_stream`（长文并行）
 
 - `GPT_SoVITS/AR/models/t2s_model.py` 新增 `infer_panel_batch_infer_dynamic_stream`：
