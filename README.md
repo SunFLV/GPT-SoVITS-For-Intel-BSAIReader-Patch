@@ -51,6 +51,30 @@ GPT_SoVITS/pretrained_models/gsv-v5-pretrained/vocoder.pth
 
 新增 3 个：`device_utils.py`、`module/cache_dit.py`、`module/models_v5.py`。修改 16 个（含 `api_v2.py`），共 19 个文件。`files/` 是应用后的完整文件，`MANIFEST.json` 是机器可读清单，`CHANGES.md` 是逐项说明。
 
+## 应用后自动声明能力（`BSAI_PATCH.json`）
+
+`apply_patch.sh` / `apply_patch.ps1` 应用成功后会调用 `write_capabilities.py`，
+在后端根目录写一个 `BSAI_PATCH.json`（**只新增这一个文件，不改后端源码**）：
+
+```json
+{
+  "patch": "BSAIReader GPT-SoVITS-For-Intel patch",
+  "models": ["v4", "v5turbo"],
+  "features": {
+    "batch_synthesize": "/tts_batch",
+    "stream_synthesize": "/tts_batch_stream",
+    "mmap_weights": true,
+    "device_agnostic": true
+  }
+}
+```
+
+`bsai/` 附加包启动时读它（再和后端 `tts_infer.yaml` 里的版本段取交集），
+决定这台机器对外宣称支持哪些模型 —— 前端「服务器选择」切换时展示的模型
+列表就来自这里。只装了一半补丁的机器不会误报能力。
+
+手工补写：`python write_capabilities.py <后端根目录>`
+
 ## 应用
 
 ```bash

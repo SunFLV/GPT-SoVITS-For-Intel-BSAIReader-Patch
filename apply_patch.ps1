@@ -22,4 +22,9 @@ try {
 }
 
 Write-Host "Applied: $patch"
+
+# 声明本机后端能力（只写 BSAI_PATCH.json，不改后端源码）
+$py = Join-Path $Target 'runtime/python.exe'
+if (-not (Test-Path $py)) { $py = 'python' }
+& $py (Join-Path $here 'write_capabilities.py') $Target
 Write-Host "Optional runtime-state patch (not applied): $(Join-Path $here 'optional/weight.json.patch')"
