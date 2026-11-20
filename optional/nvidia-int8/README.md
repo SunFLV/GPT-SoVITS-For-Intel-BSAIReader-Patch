@@ -111,14 +111,17 @@ start_nvidia_int8.bat
 
 结论：
 
-- **A770 上 INT8 没有速度收益**（18.51 vs 18.57 s，噪声范围），只有 ~326 MiB
-  显存节省 —— A770 有 15.5 GiB，显存不是瓶颈，**保持原版 fp16**；
-- P106 上 fp16 略快 3%，但 reserved 峰值 2564 MiB 已贴近 3 GiB 上限，
-  **保持 INT8** 换取余量；
-- 值得注意：**P106 反而比 A770 快一倍**（8.3~8.6 s vs 18.5 s）—— 之前的
-  IPEX 分析已经定位到 A770 的瓶颈是 CPU 侧 kernel launch（~84 µs/次，
-  CUDA 只有 ~3 µs），这张便宜的老卡在「大量小算子」的 v5Turbo 工作负载上
-  总时间反而占优。
+- **A770/XPU 已停用合成**：INT8 相对 fp16 没有速度收益（18.51 vs 18.57 s，
+  噪声范围），而且 XPU 本身比 P106 慢一倍 —— 瓶颈是 CPU 侧 kernel launch
+  （~84 µs/次，CUDA 只有 ~3 µs），v5Turbo 大量小算子的负载正好踩坑。
+  `config_intel.yaml` 里本机条目已设 `no_synth: true`：前端勾选框禁用，
+  后端也不再回退到 XPU。本机代理进程仍在（任务/进度/点读/网页都靠它），
+  只是不再当合成单元；
+- **P106 现切 fp16**（`start_nvidia_fp16.bat` + `pool_api_nvidia_fp16.json`）：
+  3 GiB 塞得下（reserved 峰值 2564 MiB），比 INT8 快 3%，是唯一合成后端。
+  本目录的 INT8 方案保留作显存吃紧时的备用；
+- 值得注意：**P106 反而比 A770 快一倍**（8.3~8.6 s vs 18.5 s），老卡在
+  「大量小算子」负载上总时间反而占优。
 
 基准脚本：`server/bench_int8_cards.py`（同一文本/seed/参考音，预热一次后
 计 3 次均值，输出 JSON SUMMARY 行）。
