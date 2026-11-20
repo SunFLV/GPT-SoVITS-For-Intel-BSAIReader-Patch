@@ -1284,7 +1284,10 @@ class TTS:
                         print(f"[dynamic] {pos}/{len(data)} 句")
                     return
                 except Exception as e:
-                    import traceback
+                    # 注意：这里不能再 import traceback —— 函数体内任何位置的
+                    # import 都会把 traceback 变成本地变量，外层 except 打印
+                    # 异常时就会 UnboundLocalError，把真实错误盖住。
+                    # （模块顶部已有全局 import traceback。）
                     traceback.print_exc()
                     # data 这时是「逐句」形态，不能继续走静态批分支（会缺字段）。
                     # 抛给调用方，由服务端退回 /tts_batch 或逐句合成。
