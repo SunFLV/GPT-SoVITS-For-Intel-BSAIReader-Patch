@@ -51,6 +51,8 @@
 - `tts_worker.py`：`BSAI_INT8_WEIGHTS=1` 时在导入 TTS 前安装 INT8 插件
 - 实测（P106-90 3G / Windows / torch 2.5.1+cu121）：加载后 1417 MiB allocated，
   单句峰值 1890 MiB；Pascal sm_61 无 Tensor Core，INT8 只省显存、不提速
+- 代理层兜底：电话参考音对 3~8 字短句会吐静音，引擎路径把短句重复一遍再试；
+  `名字说` 前缀失败自动跳过，不再让整条 `/api/tts` 502
 - 本机代理新增 `v5Turbo_INT8 NVIDIA` 引擎型服务器（9891），
   长文任务仍由 `server_intel.py` 维护，逐句把合成请求转给该池
 
