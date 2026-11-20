@@ -24,11 +24,18 @@ import io
 import json
 import os
 import socket
+import sys
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
+
+# 嵌入式 Python 的 python39._pth 只把解释器目录放进 sys.path，脚本所在目录
+# 不会自动加入；池服务需要 import 同目录的 tts_pool / tts_worker。
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
 import numpy as np
 import soundfile as sf

@@ -77,6 +77,14 @@ def main():
         os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
 
     import numpy as np
+
+    # INT8 权重加载插件必须在 TTS 之前装入：它替换 nn.Linear 并修正
+    # int8 检查点（头部哈希已变）的版本识别。非 INT8 部署完全无副作用。
+    if os.environ.get("BSAI_INT8_WEIGHTS") == "1":
+        import bsai_int8
+
+        bsai_int8.install()
+
     from GPT_SoVITS.TTS_infer_pack.TTS import TTS, TTS_Config
 
     def emit(obj):

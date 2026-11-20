@@ -201,7 +201,7 @@ def capabilities() -> dict:
     vs = voices()
     ms = models()
     return {
-        "server_name": patch.get("server_name") or os.environ.get("BSAI_SERVER_NAME") or ROOT.name,
+        "server_name": os.environ.get("BSAI_SERVER_NAME") or patch.get("server_name") or ROOT.name,
         "backend": str(ROOT),
         "patch": patch.get("patch", ""),
         "features": patch.get("features") or {},

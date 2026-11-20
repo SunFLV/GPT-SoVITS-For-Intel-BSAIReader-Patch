@@ -39,6 +39,21 @@
   因为 AR 逐 token 的 Python 循环被 GIL 串行化 —— 必须多进程；父进程导入 torch 后再 spawn 会触发
   ROCm `hipErrorInvalidImage`，故父进程不导入 torch、worker 用 subprocess 拉起
 
+## 2026-11-20 可选附加件：v5Turbo INT8 / NVIDIA P106-90（`optional/nvidia-int8/`）
+
+- 新增 `bsai_int8.py`：只在加载 `*_int8.pth` 时把 SoVITS 的 `nn.Linear` 换成
+  `Int8Linear`（INT8 权重 + fp16 per-output-channel scale，forward 时反量化），
+  兼容 DiT static cache 直接访问 `.weight` 的代码
+- 新增 `quantize_v5turbo_int8.py`：把 174 个 Linear 权重离线量化，
+  730.9 MiB → 415.3 MiB，前 16 层相对 L2 平均 1.16%
+- `optional/generic-pool-service/api_pool.py`：嵌入式 Python 的 `_pth` 不会把脚本
+  目录加入 `sys.path`，显式插入自身目录，`runtime_cuda` 下可直接启动
+- `tts_worker.py`：`BSAI_INT8_WEIGHTS=1` 时在导入 TTS 前安装 INT8 插件
+- 实测（P106-90 3G / Windows / torch 2.5.1+cu121）：加载后 1417 MiB allocated，
+  单句峰值 1890 MiB；Pascal sm_61 无 Tensor Core，INT8 只省显存、不提速
+- 本机代理新增 `v5Turbo_INT8 NVIDIA` 引擎型服务器（9891），
+  长文任务仍由 `server_intel.py` 维护，逐句把合成请求转给该池
+
 ## 动态接活 + 逐句流式 `/tts_batch_stream`（长文并行）
 
 - `GPT_SoVITS/AR/models/t2s_model.py` 新增 `infer_panel_batch_infer_dynamic_stream`：
