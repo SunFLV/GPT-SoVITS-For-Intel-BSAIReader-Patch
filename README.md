@@ -109,6 +109,10 @@ python bsai_capabilities.py          # 命令行自查当前清单
 池服务（`optional/generic-pool-service`）也挂了同样三条路由，且 `/api/voices`
 不需要 `X-API-Key`（只读元数据），方便前端在服务器下拉里直接读。
 
+NVIDIA P106-90 3G 的 INT8 部署是独立可选附件，见
+`optional/nvidia-int8/`：离线量化 `s2Gv5turbo_int8.pth`，用单独的
+`runtime_cuda`（torch 2.5.1+cu121）在 9891 起单实例池，不动原 XPU 运行时。
+
 ## 应用
 
 ```bash
