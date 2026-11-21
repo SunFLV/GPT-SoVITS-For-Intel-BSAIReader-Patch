@@ -196,7 +196,17 @@ class TTSPool:
         self._closed = False
         self._jid = 0
         self.startup_seconds = 0.0
+        # worker 自愈：记住启动参数，后台线程在成员意外退出时补回。
+        # OOM 等系统性问题会让新 worker 立刻再死，因此带退避，避免重启风暴。
+        self._warm_ref = warm_ref
+        self._warm_text = warm_text
+        self._warm_prompt = warm_prompt
+        self._heal_lock = threading.Lock()
+        self._healing = threading.Event()
+        self._heal_thread = None
         self._start(warm_ref, warm_text, warm_prompt)
+        self._heal_thread = threading.Thread(target=self._heal_loop, daemon=True, name="pool-healer")
+        self._heal_thread.start()
 
     # ---------- 启动 ----------
     def _spawn(self, warm_ref, warm_text, warm_prompt):
@@ -218,27 +228,7 @@ class TTSPool:
 
     def _start(self, warm_ref, warm_text, warm_prompt):
         t0 = time.time()
-        expect_warm = bool(warm_ref and os.path.exists(warm_ref))
-
-        def await_ready(w):
-            deadline = time.time() + self.spawn_timeout
-            while True:
-                msg = w.recv(timeout=max(1.0, deadline - time.time()))
-                kind = msg.get("type")
-                if kind == "fatal":
-                    if self.verbose:
-                        print(f"[pool] 成员加载失败: {msg.get('msg')}", flush=True)
-                    return False
-                if kind == "warn":
-                    if self.verbose:
-                        print(f"[pool] {msg.get('msg')}", flush=True)
-                    continue
-                if kind == "ready":
-                    w.device = str(msg.get("device", "?"))
-                    if not expect_warm:
-                        return True
-                if kind == "warm":
-                    return True
+        await_ready = self._make_ready_waiter()
 
         # 先全部并发拉起（错峰 0.3s），再逐个等待就绪；失败的重启重试
         pending = []
@@ -275,11 +265,115 @@ class TTSPool:
             print(f"[pool] {self.size} 个实例就绪，用时 {self.startup_seconds:.1f}s，"
                   f"device={','.join(sorted(devices))} gpu={self.gpu}", flush=True)
 
+    # ---------- worker 自愈 ----------
+    def _heal_loop(self):
+        """后台守护：成员意外退出时清理并补回，避免一次 OOM 让池永久失效。
+
+        触发来源：synthesize() 检测到死 worker 时会 set _healing；此外每 10 s
+        兜底巡检一次（覆盖「worker 死时无请求在途」的情况）。
+        补员失败会指数退避（30 s → 60 s → 120 s，上限 300 s），防止系统仍在
+        OOM 时反复拉起 worker 造成重启风暴；成功后退避清零。
+        """
+        backoff = 30
+        while not self._closed:
+            self._healing.wait(10)
+            self._healing.clear()
+            if self._closed:
+                break
+            try:
+                healed = self._replenish()
+            except Exception as exc:
+                if self.verbose:
+                    print(f"[pool] 自愈异常: {exc}", flush=True)
+                healed = False
+            if healed:
+                backoff = 30
+            else:
+                if self.verbose:
+                    print(f"[pool] 补员失败，{backoff}s 后重试", flush=True)
+                self._healing.wait(backoff)
+                self._healing.clear()
+                backoff = min(backoff * 2, 300)
+
+    def _replenish(self):
+        """清理死 worker 并补到 self.size；返回本次是否做了有效动作。"""
+        with self._heal_lock:
+            if self._closed:
+                return False
+            # 1) 从队列剔除已死的 worker（否则它们占着名额，请求会拿到死句柄）
+            live = []
+            dead = 0
+            while True:
+                try:
+                    w = self._workers.get_nowait()
+                except queue.Empty:
+                    break
+                if w.alive():
+                    live.append(w)
+                else:
+                    dead += 1
+            for w in live:
+                self._workers.put(w)
+            # 2) 同步 _all 列表
+            self._all = [w for w in self._all if w.alive()]
+            need = self.size - len(self._all)
+            if need <= 0 and dead == 0:
+                return False
+            if self.verbose:
+                print(f"[pool] 检测到 {dead} 个成员退出，补员 {need} 个", flush=True)
+            # 3) 逐个补回：复用 _spawn + await_ready 就绪判定
+            for i in range(need):
+                w = self._spawn(self._warm_ref, self._warm_text, self._warm_prompt)
+                try:
+                    await_ready = self._make_ready_waiter()
+                    ok = await_ready(w)
+                except Exception as exc:
+                    ok = False
+                    if self.verbose:
+                        print(f"[pool] 补员就绪异常: {exc}", flush=True)
+                if not ok:
+                    try:
+                        w.close()
+                    except Exception:
+                        pass
+                    return False
+                self._all.append(w)
+                self._workers.put(w)
+                if self.verbose:
+                    print(f"[pool] 补员 {i + 1}/{need} 就绪 (device={w.device})", flush=True)
+            return True
+
+    def _make_ready_waiter(self):
+        """把 _start 里的就绪判定抽成可复用函数（补员时复用同一套逻辑）。"""
+        expect_warm = bool(self._warm_ref and os.path.exists(self._warm_ref))
+
+        def await_ready(w):
+            deadline = time.time() + self.spawn_timeout
+            while True:
+                msg = w.recv(timeout=max(1.0, deadline - time.time()))
+                kind = msg.get("type")
+                if kind == "fatal":
+                    if self.verbose:
+                        print(f"[pool] 成员加载失败: {msg.get('msg')}", flush=True)
+                    return False
+                if kind == "warn":
+                    if self.verbose:
+                        print(f"[pool] {msg.get('msg')}", flush=True)
+                    continue
+                if kind == "ready":
+                    w.device = str(msg.get("device", "?"))
+                    if not expect_warm:
+                        return True
+                if kind == "warm":
+                    return True
+        return await_ready
+
     # ---------- 生命周期 ----------
     def close(self):
         if self._closed:
             return
         self._closed = True
+        self._healing.set()          # 唤醒守护线程让它看到 _closed 退出
         for w in self._all:
             try:
                 w.close()
@@ -330,6 +424,10 @@ class TTSPool:
         finally:
             if w.alive():
                 self._workers.put(w)
+            else:
+                # worker 在请求中死亡（OOM/CUDA 错误等）：唤醒后台守护补员，
+                # 否则池会永久少一个实例，后续请求全部卡在 _workers.get() 超时。
+                self._healing.set()
 
     def synthesize_many(self, jobs, max_workers=None, wait_timeout=None):
         """并发合成多条，返回同序结果（失败位置为 Exception）。"""
