@@ -1,0 +1,77 @@
+# MiMo 云端引擎离线测试配置 —— 配合 mock_mimo_server.py 使用（不访问外网）。
+# 启动：BSAI_CONFIG=本文件 BSAI_TASK_CACHE=<临时目录> server_intel.py
+# 与生产 config_intel.yaml 无关；servers 只放两台指向本地 mock 的 MiMo 引擎，
+# 分别覆盖「字面 api_key」与「${ENV} 展开」两种填法。
+server:
+  host: 127.0.0.1
+  port: 8011
+  listeners:
+  - host: 127.0.0.1
+    port: 8011
+
+# 引擎模式下不会真正启动本地后端，这里仅是占位字段
+backend: http://127.0.0.1:9890
+backend_base_port: 9890
+pool_size: 1
+intel_root: D:\BSAIReader\GPT-SoVITS-For-Intel
+
+tts:
+  device: cpu
+  is_half: false
+  version: v5turbo
+
+voices:
+- name: v4_default
+  description: 高松灯-叙述 (测试用)
+  text_lang: zh
+  prompt_lang: ja
+  ref_audio_path: D:/BSAIReader/server/voices/default_ref.mp3
+  prompt_text: そよちゃん、部活でコントラバス、だっけ
+- name: v4_phone
+  description: 电话号码参考音 (测试用)
+  text_lang: zh
+  prompt_lang: zh
+  ref_audio_path: D:/BSAIReader/server/voices/phone/ref_norm.wav
+  prompt_text: "我的电话号码是13866007742。"
+
+parallel_infer: true
+parallel_batch_size: 1
+default_model: v5turbo
+models:
+  v5turbo:
+    version: v5turbo
+    label: v5Turbo / 4 步
+    sample_steps: 4
+    is_half: false
+
+default_voice: v4_default
+
+forward_tls_verify: false
+
+servers:
+- name: "MiMo测试引擎"
+  url: "http://127.0.0.1:9930/v1"
+  desc: "本地 mock MiMo（字面 key）"
+  engine:
+    type: "mimo"
+    api_key: "sk-test-mock"
+    model: "mimo-v2.5-tts"
+    audio_format: "wav"
+    default_voice: "mimo_default"
+    rpm_limit: 600          # 测试里别让限速拖慢
+    voice_map:
+      v4_default: "冰糖"
+      v4_phone: "苏打"
+    voices: ["mimo_default", "冰糖", "苏打"]
+    emotion_instructions:
+      开心: "用开心轻快的语气朗读"
+      火海: "用饱含恨意的语气朗读"
+
+- name: "MiMo环境变量引擎"
+  url: "http://127.0.0.1:9930/v1"
+  desc: "测试 ${ENV} api_key 展开"
+  engine:
+    type: "mimo"
+    api_key: "${MIMO_TEST_KEY}"
+    model: "mimo-v2.5-tts"
+    default_voice: "mimo_default"

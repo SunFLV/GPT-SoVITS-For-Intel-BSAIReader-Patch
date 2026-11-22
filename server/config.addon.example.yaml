@@ -1,0 +1,203 @@
+﻿server:
+  host: "0.0.0.0"
+  port: 8000
+  # IPv4 (0.0.0.0) uses ai.sunflv.top cert; IPv6 (::) uses 6.sunflv.top cert
+  # Both on port 8000 — separate sockets per address family
+  listeners:
+    - host: "0.0.0.0"
+      port: 8000
+      ssl_cert: "{ADDON_DIR}/ai.sunflv.top.crt"
+      ssl_key:  "{ADDON_DIR}/ai.sunflv.top.key"
+    - host: "::"
+      port: 8000
+      ssl_cert: "{ADDON_DIR}/6.sunflv.top.crt"
+      ssl_key:  "{ADDON_DIR}/6.sunflv.top.key"
+
+backend: "http://127.0.0.1:9880"
+backend_base_port: 9880
+pool_size: 2
+intel_root: "{BACKEND_DIR}"
+# ── 后端池 ──────────────────────────────────────────────────────
+# 所有音色统一走 v5Turbo 底模，不再按版本切模型。实例数量由下面的
+# parallel_infer 开关决定：开启=每模型 1 实例（实例内并行），
+# 关闭=每模型 ports_per_model 个实例（多实例并发）。
+# 显存预算：单份模型约 2.2 GiB（A770 15.56 GiB）；若关闭并行开 4 实例，
+# 加推理激活约 12-13 GiB，余量有限 —— 请勿再增加并发数。
+# 冷启动按需触发（首个请求才加载），加载过程全局串行以避免瞬时显存峰值。
+# 关键：单个 api_v2 进程加载模型后约占 7 GB RAM / 8.3 GB 私有内存（实测），
+# 机器总内存仅 15.86 GB，因此空闲后必须卸载释放，否则会持续挤占内存直至 OOM。
+# pool_idle_ttl: 后端空闲超过该秒数即停止进程、释放模型；0=从不卸载（会 OOM，勿用）。
+pool_idle_ttl: 300       # 5 分钟空闲即卸载；下次请求冷加载（约 20-90 s）
+pool_evict_grace: 0      # 兼容旧配置；单模型池不再驱逐对等端口
+
+tts:
+  device: "xpu"
+  is_half: true  # fp16 在 XPU 上偶发静音，改 fp32 提高稳定性
+  version: v5turbo
+  t2s_weights_path: "GPT_SoVITS/pretrained_models/s1v3.ckpt"
+  vits_weights_path: "GPT_SoVITS/pretrained_models/gsv-v5-pretrained/s2Gv5turbo.pth"
+  bert_base_path: "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large"
+  cnhuhbert_base_path: "GPT_SoVITS/pretrained_models/chinese-hubert-base"
+
+voices:
+  - name: "v4_default"
+    description: "高松灯-叙述 (中文输入)"
+    text_lang: "zh"
+    prompt_lang: "ja"
+    ref_audio_path: "{ADDON_DIR}/voices/default_ref.mp3"
+    prompt_text: "そよちゃん、部活でコントラバス、だっけ"
+
+  - name: "v4_tomori"
+    description: "高松灯-开心"
+    text_lang: "zh"
+    prompt_lang: "ja"
+    ref_audio_path: "{ADDON_DIR}/voices/tomori/ref.wav"
+    prompt_text: "ありがとう、立希ちゃん"
+
+  - name: "v4_anon"
+    description: "千早爱音-兴奋"
+    text_lang: "zh"
+    prompt_lang: "ja"
+    ref_audio_path: "{ADDON_DIR}/voices/anon/ref.wav"
+    prompt_text: "なんて思ったり、よーしライブ成功!みんなで写真撮ってSNSにアップしちゃおう!"
+
+  - name: "v4_taki"
+    description: "椎名立希-军训"
+    text_lang: "zh"
+    prompt_lang: "ja"
+    ref_audio_path: "{ADDON_DIR}/voices/taki/ref.wav"
+    prompt_text: "あのお前も全然ダメ人の倍練習して"
+
+  - name: "v4_rana"
+    description: "要乐奈-叙述"
+    text_lang: "zh"
+    prompt_lang: "ja"
+    ref_audio_path: "{ADDON_DIR}/voices/rana/ref.mp3"
+    prompt_text: "楽しかった。お腹すいた。お蕎麦食べたい。"
+
+  - name: "v4_soyo"
+    description: "长崎素世-叙述"
+    text_lang: "zh"
+    prompt_lang: "ja"
+    ref_audio_path: "{ADDON_DIR}/voices/soyo/ref.wav"
+    prompt_text: "ありがと。見てないんじゃない私に言われても。"
+
+  - name: "v4_sunflv"
+    description: "SunFLV本人音色 (最新训练)"
+    text_lang: "zh"
+    prompt_lang: "zh"
+    ref_audio_path: "{ADDON_DIR}/voices/sunflv/ref.wav"
+    prompt_text: "火海般的恨意让他立于巅峰，却被一滴和50年前同样蓝、同样清澈的水滴浇灭。"
+
+# ── 并行推理开关 ────────────────────────────────────────────────
+# parallel_infer = 是否启用并行推理，决定实例池策略：
+#   true  -> 强制单实例：无论请求什么版本，都只用默认模型的 1 个实例
+#             （多实例会因内存/显存不足 OOM）。显存只占约 2.2 GiB。
+#             长文按 parallel_batch_size 句一批提交（后端一次前向解多句、
+#             逐句返回音频，点读时间点不变）。A770 实测：
+#               逐句 12.1s/句；4 句 8.2s/句（1.5×）；8 句 5.6s/句（2.1×）
+#             8 句虽然更快，但同批干扰导致音质下降（串句/尾音发虚），
+#             所以默认只用 4 句；12/16 句不再提速，只增显存峰值。
+#   false -> 保持原状：相同模型也启动多个实例并发，实例数由 ports_per_model
+#             决定（4 个 → 9880-9883），实例内改用串行推理。
+# 批量失败（老后端没有 /tts_batch、静音、超长句）会自动退回逐句合成。
+parallel_infer: true
+# 并发槽位/批大小。8 句虽然最快（5.6s/句），但同批句子互相干扰明显、音质变差
+# （串句、尾音发虚），实测听感损失不可接受 —— 4 句是速度与质量的分界点。
+# 1 = 逐句串行（每句一个请求）。多句合批在长文上音质损失明显（8 句串句、
+# 尾音发虚），4 句也有轻微影响，所以默认回到逐句。
+parallel_batch_size: 1   # 仅 parallel_infer=true 时生效
+# 批内长度容忍度：AR 是所有序列同步走一步，批里只要有一句特别长，短句就得
+# padding 陪它跑到最后（槽位空转）。只把长度在 [1/ratio, ratio] 倍的句子凑
+# 一批，离群句自己一批；<=1 表示不约束。
+# A770 / 16 句自然文本实测：不约束 127.1s、ratio=2 143.1s（批被切碎，更慢）、
+# ratio=3 118~127s（与不约束持平，且能把「4 字 vs 67 字」这种极端组合拆开）。
+# 1.0 = 不做长度约束。之前用 3 倍是想避免"短句陪长句跑"，但小说正文里
+# 对话句和叙述句交替、长度差常常超过 3 倍，结果 662 句被切成 268 批、93 批
+# 只有 1 句（等于退回串行）。既然并发槽位已经压到 4，就让批尽量凑满 4 句。
+parallel_batch_len_ratio: 1.0
+# dynamic_batch: 真正的「算好一句接下一句 + 算好一句发一句」。
+#   后端槽位一空就补下一句（不用等这一批里最长的句子），每完成一句立刻回传；
+#   服务端收到就落盘 + 更新进度，所以点读的第一句 20 秒内就能用，不必等整批。
+#   打开后：parallel_batch_size = 并发槽位数，parallel_queue_size = 一次请求
+#   提交多少句，parallel_batch_len_ratio 不再生效（长短混排也无所谓）。
+# 动态接活（槽位一空就补下一句 + 逐句流式）实测在长任务上会卡死：AR 循环在
+# 插入新序列后 tqdm 停止推进、句子不 EOS，整条任务挂住。恢复稳定优先，先关闭；
+# 静态批 + 4 槽位是验证过的路径（8.2 s/句，音质与逐句一致）。
+dynamic_batch: false
+parallel_queue_size: 32
+
+# 推理配置：所有音色统一使用 v5Turbo。前端即使传旧版本名（如 v4）也会被
+# 归一化到这个唯一 profile —— 服务端不再加载任何 v4 模型。
+# ports_per_model 仅在 parallel_infer=false 时生效。
+default_model: "v5turbo"
+ports_per_model: 4
+models:
+  v5turbo:
+    version: v5turbo
+    label: "v5Turbo / 4 步"
+    t2s_weights_path: "GPT_SoVITS/pretrained_models/s1v3.ckpt"
+    vits_weights_path: "GPT_SoVITS/pretrained_models/gsv-v5-pretrained/s2Gv5turbo.pth"
+    sample_steps: 4
+    is_half: true
+
+# ── 前端可选的 TTS 服务器 ──────────────────────────────────────
+# 前端下拉框直接读 /api/servers，按这个列表渲染。
+#   url 为空字符串 = 同源（相对路径 /api/...），推荐本机用这个；
+#   url 填完整根地址（如 https://other-host:8000）= 前端把请求发到那台机器，
+#   那台机器的 /api/servers 也会出现在列表里（用它自己的配置）。
+# 前端不直连远端：所有请求都带 _srv=<下标> 发到本机，由本机转发过去
+# （跨域、混合内容都不再是问题；Range 与 SSE 会原样透传）。
+# 远端连不上时返回 502 并给出原因。
+# 转发到自签名 https 的远端时要不要校验证书。内网/自签一般关掉；
+# 如果远端是正规证书，改成 true 更安全。
+forward_tls_verify: false
+
+servers:
+  # 本机 XPU/A770 合成已停用（实测只有 CUDA 的一半速度），本机条目整个去掉。
+  # 本机代理进程仍在，负责网页/任务/进度/点读/合并音频，只是不再是合成后端。
+  # 第 0 位 = P106：前端默认勾选它，旧客户端不带 _srv 时也默认走它。
+  # - 长文任务/进度/点读仍在本机，只有每句合成转发到 9891
+  # - 池服务用后端根目录的 start_nvidia_fp16.bat 启动
+  # - P106 是 sm_61，实测 fp16 比 INT8 快 3% 且 3 GiB 塞得下（reserved 峰值 2.6 GiB）
+  - name: "P106-90 fp16 (CUDA)"
+    url: "http://127.0.0.1:9891"
+    desc: "P106-90 3G · CUDA / v5Turbo fp16（比 XPU 快一倍）"
+    engine:
+      api_key: "bsai-..."
+      default_voice: "v4_phone"
+
+  # ── 可选云端引擎：小米 MiMo 免费 TTS ──────────────────────────────
+  # 需自备 MiMo API Key（到 platform.xiaomimimo.com 注册创建，sk- 开头），
+  # 用环境变量 MIMO_API_KEY 或直接写进 engine.api_key 均可；
+  # 未配置 Key 时不要勾选该服务器（勾选后合成会因鉴权失败报错）。
+  - name: "MiMo TTS (限时免费)"
+    url: "https://api.xiaomimimo.com/v1"
+    desc: "小米 MiMo 在线 TTS · 限时免费 · 24kHz 云端合成"
+    engine:
+      type: "mimo"                    # 引擎类型：gptsovits(默认，现有池) | mimo(小米 MiMo 在线 API)
+      api_key: "${MIMO_API_KEY}"      # 支持 ${ENV} 展开填法；展开后为空时回落读环境变量 MIMO_API_KEY
+      model: "mimo-v2.5-tts"          # 可选 mimo-v2.5-tts | mimo-v2.5-tts-voicedesign | mimo-v2.5-tts-voiceclone
+      audio_format: "wav"             # wav | mp3 | pcm | pcm16（本期非流式，用 wav）
+      default_voice: "mimo_default"
+      rpm_limit: 90                   # 官方账号级限流 100 RPM/模型，留安全余量
+      voice_map:                      # 本机音色名 → MiMo 预置音色
+        v4_default: "茉莉"
+        v4_tomori: "冰糖"
+        v4_anon: "Chloe"
+        v4_taki: "苏打"
+        v4_rana: "Mia"
+        v4_soyo: "茉莉"
+        v4_phone: "冰糖"
+        v4_sunflv: "苏打"
+      voices: ["mimo_default", "冰糖", "茉莉", "苏打", "白桦", "Mia", "Chloe", "Milo", "Dean"]
+      emotion_instructions:           # 语气标签 → 自然语言风格指令（MiMo 不收参考音，只收文字）
+        # 该词汇表与本地音色的情绪参考音相互隔离，仅在勾选 MiMo 引擎时生效；
+        # 请求可用 style 字段/X-BSAI-Style 头直接给自由文本指令（优先级更高）
+        开心: "用开心轻快的语气朗读，语调上扬，充满活力"
+        悲伤: "用低落悲伤的语气朗读，语速放缓，声音略带哽咽"
+        愤怒: "用愤怒严厉的语气朗读，声音有力，情绪激烈"
+        火海: "用饱含恨意、压抑中爆发的语气朗读，情绪浓烈"
+        温柔: "用温柔轻柔的语气朗读，像睡前故事一样平和"
+        悬疑: "用紧张悬疑的语气朗读，压低声音，营造悬念"
+        电话: ""                      # 中性叙述，不加指令
